@@ -1,0 +1,21 @@
+name: Sync Tags from Upstream
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天同步一次（可选）
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  sync-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/usememos/memos.git
+          git fetch upstream --tags
+
+      - name: Push tags to fork
+        run: |
+          git push origin --tags
