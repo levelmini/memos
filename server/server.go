@@ -7,6 +7,8 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,12 +19,12 @@ import (
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
 
+	"github.com/usememos/memos/internal/profile"
 	storepb "github.com/usememos/memos/proto/gen/store"
-	"github.com/usememos/memos/server/profile"
+	"github.com/usememos/memos/server/profiler"
 	apiv1 "github.com/usememos/memos/server/router/api/v1"
 	"github.com/usememos/memos/server/router/frontend"
 	"github.com/usememos/memos/server/router/rss"
-	"github.com/usememos/memos/server/runner/memopayload"
 	"github.com/usememos/memos/server/runner/s3presign"
 	"github.com/usememos/memos/store"
 )
@@ -32,8 +34,10 @@ type Server struct {
 	Profile *profile.Profile
 	Store   *store.Store
 
-	echoServer *echo.Echo
-	grpcServer *grpc.Server
+	echoServer        *echo.Echo
+	grpcServer        *grpc.Server
+	profiler          *profiler.Profiler
+	runnerCancelFuncs []context.CancelFunc
 }
 
 func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store) (*Server, error) {
@@ -48,6 +52,13 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 	echoServer.HidePort = true
 	echoServer.Use(middleware.Recover())
 	s.echoServer = echoServer
+
+	if profile.Mode != "prod" {
+		// Initialize profiler
+		s.profiler = profiler.NewProfiler()
+		s.profiler.RegisterRoutes(echoServer)
+		s.profiler.StartMemoryMonitor(ctx)
+	}
 
 	workspaceBasicSetting, err := s.getOrUpsertWorkspaceBasicSetting(ctx)
 	if err != nil {
@@ -65,7 +76,7 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 		return c.String(http.StatusOK, "Service ready.")
 	})
 
-	// Serve frontend resources.
+	// Serve frontend static files.
 	frontend.NewFrontendService(profile, store).Serve(ctx, echoServer)
 
 	rootGroup := echoServer.Group("")
@@ -73,12 +84,15 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 	// Create and register RSS routes.
 	rss.NewRSSService(s.Profile, s.Store).RegisterRoutes(rootGroup)
 
+	// Log full stacktraces if we're in dev
+	logStacktraces := profile.IsDev()
+
 	grpcServer := grpc.NewServer(
-		// Override the maximum receiving message size to math.MaxInt32 for uploading large resources.
+		// Override the maximum receiving message size to math.MaxInt32 for uploading large attachments.
 		grpc.MaxRecvMsgSize(math.MaxInt32),
 		grpc.ChainUnaryInterceptor(
-			apiv1.NewLoggerInterceptor().LoggerInterceptor,
-			grpcrecovery.UnaryServerInterceptor(),
+			apiv1.NewLoggerInterceptor(logStacktraces).LoggerInterceptor,
+			newRecoveryInterceptor(logStacktraces),
 			apiv1.NewGRPCAuthInterceptor(store, secret).AuthenticationInterceptor,
 		))
 	s.grpcServer = grpcServer
@@ -90,6 +104,26 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 	}
 
 	return s, nil
+}
+
+func newRecoveryInterceptor(logStacktraces bool) grpc.UnaryServerInterceptor {
+	var recoveryOptions []grpcrecovery.Option
+	if logStacktraces {
+		recoveryOptions = append(recoveryOptions, grpcrecovery.WithRecoveryHandler(func(p any) error {
+			if p == nil {
+				return nil
+			}
+
+			switch val := p.(type) {
+			case runtime.Error:
+				return &stacktraceError{err: val, stacktrace: debug.Stack()}
+			default:
+				return nil
+			}
+		}))
+	}
+
+	return grpcrecovery.UnaryServerInterceptor(recoveryOptions...)
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -134,6 +168,15 @@ func (s *Server) Shutdown(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	slog.Info("server shutting down")
+
+	// Cancel all background runners
+	for _, cancelFunc := range s.runnerCancelFuncs {
+		if cancelFunc != nil {
+			cancelFunc()
+		}
+	}
+
 	// Shutdown echo server.
 	if err := s.echoServer.Shutdown(ctx); err != nil {
 		slog.Error("failed to shutdown server", slog.String("error", err.Error()))
@@ -141,6 +184,20 @@ func (s *Server) Shutdown(ctx context.Context) {
 
 	// Shutdown gRPC server.
 	s.grpcServer.GracefulStop()
+
+	// Stop the profiler
+	if s.profiler != nil {
+		slog.Info("stopping profiler")
+		// Log final memory stats
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		slog.Info("final memory stats before exit",
+			"heapAlloc", m.Alloc,
+			"heapSys", m.Sys,
+			"heapObjects", m.HeapObjects,
+			"numGoroutine", runtime.NumGoroutine(),
+		)
+	}
 
 	// Close database connection.
 	if err := s.Store.Close(); err != nil {
@@ -151,13 +208,25 @@ func (s *Server) Shutdown(ctx context.Context) {
 }
 
 func (s *Server) StartBackgroundRunners(ctx context.Context) {
+	// Create a separate context for each background runner
+	// This allows us to control cancellation for each runner independently
+	s3Context, s3Cancel := context.WithCancel(ctx)
+
+	// Store the cancel function so we can properly shut down runners
+	s.runnerCancelFuncs = append(s.runnerCancelFuncs, s3Cancel)
+
+	// Create and start S3 presign runner
 	s3presignRunner := s3presign.NewRunner(s.Store)
 	s3presignRunner.RunOnce(ctx)
-	memopayloadRunner := memopayload.NewRunner(s.Store)
-	// Rebuild all memos' payload after server starts.
-	memopayloadRunner.RunOnce(ctx)
 
-	go s3presignRunner.Run(ctx)
+	// Start continuous S3 presign runner
+	go func() {
+		s3presignRunner.Run(s3Context)
+		slog.Info("s3presign runner stopped")
+	}()
+
+	// Log the number of goroutines running
+	slog.Info("background runners started", "goroutines", runtime.NumGoroutine())
 }
 
 func (s *Server) getOrUpsertWorkspaceBasicSetting(ctx context.Context) (*storepb.WorkspaceBasicSetting, error) {
@@ -181,4 +250,24 @@ func (s *Server) getOrUpsertWorkspaceBasicSetting(ctx context.Context) (*storepb
 		workspaceBasicSetting = workspaceSetting.GetBasicSetting()
 	}
 	return workspaceBasicSetting, nil
+}
+
+// stacktraceError wraps an underlying error and captures the stacktrace. It
+// implements fmt.Formatter, so it'll be rendered when invoked by something like
+// `fmt.Sprint("%v", err)`.
+type stacktraceError struct {
+	err        error
+	stacktrace []byte
+}
+
+func (e *stacktraceError) Error() string {
+	return e.err.Error()
+}
+
+func (e *stacktraceError) Unwrap() error {
+	return e.err
+}
+
+func (e *stacktraceError) Format(f fmt.State, _ rune) {
+	f.Write(e.stacktrace)
 }

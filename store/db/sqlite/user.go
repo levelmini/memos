@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/usememos/memos/plugin/filter"
 	"github.com/usememos/memos/store"
 )
 
 func (d *DB) CreateUser(ctx context.Context, create *store.User) (*store.User, error) {
-	fields := []string{"`username`", "`role`", "`email`", "`nickname`", "`password_hash`"}
-	placeholder := []string{"?", "?", "?", "?", "?"}
-	args := []any{create.Username, create.Role, create.Email, create.Nickname, create.PasswordHash}
-	stmt := "INSERT INTO user (" + strings.Join(fields, ", ") + ") VALUES (" + strings.Join(placeholder, ", ") + ") RETURNING id, avatar_url, description, created_ts, updated_ts, row_status"
+	fields := []string{"`username`", "`role`", "`email`", "`nickname`", "`password_hash`, `avatar_url`"}
+	placeholder := []string{"?", "?", "?", "?", "?", "?"}
+	args := []any{create.Username, create.Role, create.Email, create.Nickname, create.PasswordHash, create.AvatarURL}
+	stmt := "INSERT INTO user (" + strings.Join(fields, ", ") + ") VALUES (" + strings.Join(placeholder, ", ") + ") RETURNING id, description, created_ts, updated_ts, row_status"
 	if err := d.db.QueryRowContext(ctx, stmt, args...).Scan(
 		&create.ID,
-		&create.AvatarURL,
 		&create.Description,
 		&create.CreatedTs,
 		&create.UpdatedTs,
@@ -53,6 +53,9 @@ func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.U
 	if v := update.Description; v != nil {
 		set, args = append(set, "description = ?"), append(args, *v)
 	}
+	if v := update.Role; v != nil {
+		set, args = append(set, "role = ?"), append(args, *v)
+	}
 	args = append(args, update.ID)
 
 	query := `
@@ -83,6 +86,26 @@ func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.U
 
 func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User, error) {
 	where, args := []string{"1 = 1"}, []any{}
+
+	for _, filterStr := range find.Filters {
+		// Parse filter string and return the parsed expression.
+		// The filter string should be a CEL expression.
+		parsedExpr, err := filter.Parse(filterStr, filter.UserFilterCELAttributes...)
+		if err != nil {
+			return nil, err
+		}
+		convertCtx := filter.NewConvertContext()
+		// ConvertExprToSQL converts the parsed expression to a SQL condition string.
+		converter := filter.NewUserSQLConverter(&filter.SQLiteDialect{})
+		if err := converter.ConvertExprToSQL(convertCtx, parsedExpr.GetExpr()); err != nil {
+			return nil, err
+		}
+		condition := convertCtx.Buffer.String()
+		if condition != "" {
+			where = append(where, fmt.Sprintf("(%s)", condition))
+			args = append(args, convertCtx.Args...)
+		}
+	}
 
 	if v := find.ID; v != nil {
 		where, args = append(where, "id = ?"), append(args, *v)
