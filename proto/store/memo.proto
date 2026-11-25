@@ -17,8 +17,10 @@ message MemoPayload {
     bool has_task_list = 2;
     bool has_code = 3;
     bool has_incomplete_tasks = 4;
-    // The references of the memo. Should be a list of uuid.
-    repeated string references = 5;
+    // The title extracted from the first H1 heading, if present.
+    string title = 5;
+    // Whether the content contains a Markdown image.
+    bool has_inline_image = 6;
   }
 
   message Location {

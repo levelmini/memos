@@ -1,9 +1,11 @@
 package store
 
 import (
+	"sync"
 	"time"
 
 	"github.com/usememos/memos/internal/profile"
+	"github.com/usememos/memos/provider/storage"
 	"github.com/usememos/memos/store/cache"
 )
 
@@ -12,13 +14,25 @@ type Store struct {
 	profile *profile.Profile
 	driver  Driver
 
+	userCreateMu   sync.Mutex
+	authConfigMu   sync.Mutex
+	refreshTokenMu sync.Mutex
+	patMu          sync.Mutex
+	memoViewMu     sync.Mutex
+
 	// Cache settings
 	cacheConfig cache.Config
 
 	// Caches
-	workspaceSettingCache *cache.Cache // cache for workspace settings
-	userCache             *cache.Cache // cache for users
-	userSettingCache      *cache.Cache // cache for user settings
+	instanceSettingCache *cache.Cache // cache for instance settings
+	userCache            *cache.Cache // cache for users
+	userSettingCache     *cache.Cache // cache for user settings
+
+	// storageDriverCache reuses object-storage clients across requests, keyed
+	// by the resolved configuration. Reset whenever the STORAGE setting changes.
+	storageDriverMu         sync.Mutex
+	storageDriverGeneration uint64
+	storageDriverCache      map[storageDriverCacheKey]storage.Driver
 }
 
 // New creates a new instance of Store.
@@ -32,12 +46,12 @@ func New(driver Driver, profile *profile.Profile) *Store {
 	}
 
 	store := &Store{
-		driver:                driver,
-		profile:               profile,
-		cacheConfig:           cacheConfig,
-		workspaceSettingCache: cache.New(cacheConfig),
-		userCache:             cache.New(cacheConfig),
-		userSettingCache:      cache.New(cacheConfig),
+		driver:               driver,
+		profile:              profile,
+		cacheConfig:          cacheConfig,
+		instanceSettingCache: cache.New(cacheConfig),
+		userCache:            cache.New(cacheConfig),
+		userSettingCache:     cache.New(cacheConfig),
 	}
 
 	return store
@@ -47,9 +61,14 @@ func (s *Store) GetDriver() Driver {
 	return s.driver
 }
 
+// GetDataDir returns the store data directory.
+func (s *Store) GetDataDir() string {
+	return s.profile.Data
+}
+
 func (s *Store) Close() error {
 	// Stop all cache cleanup goroutines
-	s.workspaceSettingCache.Close()
+	s.instanceSettingCache.Close()
 	s.userCache.Close()
 	s.userSettingCache.Close()
 

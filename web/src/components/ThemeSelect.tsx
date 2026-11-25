@@ -1,49 +1,55 @@
-import { Moon, Palette, Sun, Wallpaper } from "lucide-react";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { workspaceStore } from "@/store";
+import { Select } from "@usememos/ui";
+import { Monitor, Moon, Palette, Sun } from "lucide-react";
+import type { ReactElement } from "react";
+import { useTranslate } from "@/utils/i18n";
+import { loadTheme, THEME_OPTIONS } from "@/utils/theme";
 
 interface ThemeSelectProps {
   value?: string;
   onValueChange?: (theme: string) => void;
   className?: string;
+  compact?: boolean;
 }
 
-const ThemeSelect = ({ value, onValueChange, className }: ThemeSelectProps = {}) => {
-  const currentTheme = value || workspaceStore.state.theme || "default";
+const THEME_ICONS: Record<string, ReactElement> = {
+  system: <Monitor className="mu-icon" />,
+  default: <Sun className="mu-icon" />,
+  "default-dark": <Moon className="mu-icon" />,
+  paper: <Palette className="mu-icon" />,
+};
 
-  const themeOptions: { value: Theme; icon: JSX.Element; label: string }[] = [
-    { value: "default", icon: <Sun className="w-4 h-4" />, label: "Default Light" },
-    { value: "default-dark", icon: <Moon className="w-4 h-4" />, label: "Default Dark" },
-    { value: "paper", icon: <Palette className="w-4 h-4" />, label: "Paper" },
-    { value: "whitewall", icon: <Wallpaper className="w-4 h-4" />, label: "Whitewall" },
-  ];
+const ThemeSelect = ({ value, onValueChange, className, compact = false }: ThemeSelectProps = {}) => {
+  const t = useTranslate();
+  const currentTheme = value || "system";
+  const options = THEME_OPTIONS.map((option) => ({ value: option.value, label: t(option.labelKey) }));
+  const triggerLabel =
+    currentTheme === "system" ? t("setting.preference.theme-system-short") : options.find((option) => option.value === currentTheme)?.label;
 
-  const handleThemeChange = (newTheme: Theme) => {
+  const handleThemeChange = (newTheme: string) => {
+    // Apply theme globally immediately
+    loadTheme(newTheme);
+    // Also notify parent component if callback is provided
     if (onValueChange) {
       onValueChange(newTheme);
-    } else {
-      workspaceStore.setTheme(newTheme);
     }
   };
 
   return (
-    <Select value={currentTheme} onValueChange={handleThemeChange}>
-      <SelectTrigger className={className}>
-        <div className="flex items-center gap-2">
-          <SelectValue placeholder="Select theme" />
+    <Select.Root value={currentTheme} items={options} onValueChange={(value) => value !== null && handleThemeChange(value)}>
+      <Select.Trigger className={className}>
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          {compact && THEME_ICONS[currentTheme]}
+          {compact ? <span className="truncate">{triggerLabel}</span> : <Select.Value className="truncate" />}
         </div>
-      </SelectTrigger>
-      <SelectContent>
-        {themeOptions.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
-            <div className="flex items-center gap-2">
-              {option.icon}
-              <span>{option.label}</span>
-            </div>
-          </SelectItem>
+      </Select.Trigger>
+      <Select.Popup>
+        {options.map((option) => (
+          <Select.Item key={option.value} value={option.value} icon={THEME_ICONS[option.value]}>
+            {option.label}
+          </Select.Item>
         ))}
-      </SelectContent>
-    </Select>
+      </Select.Popup>
+    </Select.Root>
   );
 };
 

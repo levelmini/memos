@@ -1,76 +1,94 @@
-import dayjs from "dayjs";
-import { observer } from "mobx-react-lite";
 import { useMemo } from "react";
+import { MemoEditor } from "@/components/MemoEditor";
+import { deriveDefaultCreateTimeFromFilters } from "@/components/MemoEditor/edit/utils/deriveDefaultCreateTime";
 import MemoView from "@/components/MemoView";
-import PagedMemoList from "@/components/PagedMemoList";
+import PagedMemoList, { EmptyLine, getMemoKey } from "@/components/PagedMemoList";
+import { useWelcomeGuide, WelcomeGuideDialog } from "@/components/WelcomeGuide";
+import { useAuth } from "@/contexts/AuthContext";
+import { useGlobalMemoEditor } from "@/contexts/GlobalMemoEditorContext";
+import { useMemoFilterContext } from "@/contexts/MemoFilterContext";
+import { NewMemoProvider } from "@/contexts/NewMemoContext";
+import { useSpaceContext } from "@/contexts/SpaceContext";
+import { useMemoFilters, useMemoSorting } from "@/hooks";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import { viewStore, userStore, workspaceStore } from "@/store";
-import { extractUserIdFromName } from "@/store/common";
-import memoFilterStore from "@/store/memoFilter";
-import { State } from "@/types/proto/api/v1/common";
-import { Memo } from "@/types/proto/api/v1/memo_service";
-import { WorkspaceSetting_Key } from "@/types/proto/api/v1/workspace_service";
+import { useMemoSuggestions } from "@/hooks/useMemoSuggestions";
+import { State } from "@/types/proto/api/common_pb";
+import { Memo } from "@/types/proto/api/memo_service_pb";
+import { useTranslate } from "@/utils/i18n";
 
-// Helper function to extract shortcut ID from resource name
-// Format: users/{user}/shortcuts/{shortcut}
-const getShortcutId = (name: string): string => {
-  const parts = name.split("/");
-  return parts.length === 4 ? parts[3] : "";
-};
-
-const Home = observer(() => {
+const Home = () => {
   const user = useCurrentUser();
-  const selectedShortcut = userStore.state.shortcuts.find((shortcut) => getShortcutId(shortcut.name) === memoFilterStore.shortcut);
+  const suggestions = useMemoSuggestions();
+  const t = useTranslate();
+  const { isUserSettingsInitialized } = useAuth();
+  const { claimHomeAutoFocus } = useGlobalMemoEditor();
+  const { filters } = useMemoFilterContext();
+  const { memoFilter: contextFilter, selectedSpaceName, creatorUsername } = useSpaceContext();
+  const defaultCreateTime = useMemo(() => deriveDefaultCreateTimeFromFilters(filters), [filters]);
 
-  const memoFilter = useMemo(() => {
-    const conditions = [`creator_id == ${extractUserIdFromName(user.name)}`];
-    if (selectedShortcut?.filter) {
-      conditions.push(selectedShortcut.filter);
-    }
-    for (const filter of memoFilterStore.filters) {
-      if (filter.factor === "contentSearch") {
-        conditions.push(`content.contains("${filter.value}")`);
-      } else if (filter.factor === "tagSearch") {
-        conditions.push(`tag in ["${filter.value}"]`);
-      } else if (filter.factor === "pinned") {
-        conditions.push(`pinned`);
-      } else if (filter.factor === "property.hasLink") {
-        conditions.push(`has_link`);
-      } else if (filter.factor === "property.hasTaskList") {
-        conditions.push(`has_task_list`);
-      } else if (filter.factor === "property.hasCode") {
-        conditions.push(`has_code`);
-      } else if (filter.factor === "displayTime") {
-        const displayWithUpdateTime = workspaceStore.getWorkspaceSettingByKey(WorkspaceSetting_Key.MEMO_RELATED).memoRelatedSetting
-          ?.displayWithUpdateTime;
-        const factor = displayWithUpdateTime ? "updated_ts" : "created_ts";
-        const filterDate = new Date(filter.value);
-        const filterUtcTimestamp = filterDate.getTime() + filterDate.getTimezoneOffset() * 60 * 1000;
-        const timestampAfter = filterUtcTimestamp / 1000;
-        conditions.push(`${factor} >= ${timestampAfter} && ${factor} < ${timestampAfter + 60 * 60 * 24}`);
-      }
-    }
-    return conditions.length > 0 ? conditions.join(" && ") : undefined;
-  }, [memoFilterStore.filters, selectedShortcut?.filter]);
+  const memoFilter = useMemoFilters({
+    includeMemoViews: true,
+    includePinned: true,
+  });
+  const canComposeInScope = Boolean(user && (!creatorUsername || creatorUsername === user.username));
+  // The welcome guide belongs to the account's own timeline, not to Explore, a space or
+  // another member's page.
+  const onOwnHome = Boolean(user && creatorUsername === user.username);
+  const welcomeGuide = useWelcomeGuide(onOwnHome);
+  // Pinning is the owner's arrangement of their own memos, so it only shapes a single
+  // creator's feed; a mixed-author feed like Explore or a Space stays purely chronological.
+  const honorPinned = Boolean(creatorUsername);
+
+  const { listSort, orderBy } = useMemoSorting({
+    pinnedFirst: honorPinned,
+    state: State.NORMAL,
+  });
 
   return (
-    <div className="w-full min-h-full bg-background text-foreground">
-      <PagedMemoList
-        renderer={(memo: Memo) => <MemoView key={`${memo.name}-${memo.displayTime}`} memo={memo} showVisibility showPinned compact />}
-        listSort={(memos: Memo[]) =>
-          memos
-            .filter((memo) => memo.state === State.NORMAL)
-            .sort((a, b) =>
-              viewStore.state.orderByTimeAsc
-                ? dayjs(a.displayTime).unix() - dayjs(b.displayTime).unix()
-                : dayjs(b.displayTime).unix() - dayjs(a.displayTime).unix(),
-            )
-        }
-        orderBy={viewStore.state.orderByTimeAsc ? "display_time asc" : "display_time desc"}
-        filter={memoFilter}
-      />
+    <div className="w-full min-h-full bg-mu-canvas text-mu-text">
+      <WelcomeGuideDialog open={welcomeGuide.open} onOpenChange={welcomeGuide.onOpenChange} />
+      <NewMemoProvider>
+        <PagedMemoList
+          renderer={(memo: Memo, { compact }) => (
+            <MemoView
+              key={getMemoKey(memo)}
+              memo={memo}
+              showCreator={!creatorUsername}
+              showVisibility
+              showPinned={honorPinned}
+              showSpace={!selectedSpaceName}
+              compact={compact}
+            />
+          )}
+          listSort={listSort}
+          orderBy={orderBy}
+          filter={memoFilter}
+          contextFilter={contextFilter}
+          emptyState={
+            <EmptyLine
+              message={t("memo.no-memos-yet")}
+              action={onOwnHome ? t("welcome.reopen") : undefined}
+              onAction={onOwnHome ? welcomeGuide.show : undefined}
+            />
+          }
+          renderLeading={({ useGrid }) => {
+            if (!isUserSettingsInitialized || !canComposeInScope) return null;
+
+            return (
+              <MemoEditor
+                // Each Space keeps its own timeline draft; the editor restarts when the Space changes.
+                draft={{ scope: "home", space: selectedSpaceName, createTime: defaultCreateTime }}
+                autoFocus={claimHomeAutoFocus}
+                className={useGrid ? undefined : "mb-2"}
+                placeholder={t("editor.any-thoughts")}
+                suggestions={suggestions}
+              />
+            );
+          }}
+        />
+      </NewMemoProvider>
     </div>
   );
-});
+};
 
 export default Home;

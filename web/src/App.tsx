@@ -1,85 +1,82 @@
-import { observer } from "mobx-react-lite";
+import { DirectionProvider } from "@base-ui/react/direction-provider";
 import { useEffect } from "react";
-import { useTranslation } from "react-i18next";
-import { Outlet } from "react-router-dom";
+import { Outlet, ScrollRestoration } from "react-router-dom";
+import { useInstance } from "./contexts/InstanceContext";
+import { TimelineViewProvider } from "./contexts/ViewContext";
 import useNavigateTo from "./hooks/useNavigateTo";
-import { userStore, workspaceStore } from "./store";
-import { loadTheme } from "./utils/theme";
+import { useUserLocale } from "./hooks/useUserLocale";
+import { useUserTheme } from "./hooks/useUserTheme";
+import { DEFAULT_FAVICON, getCustomLogoUrl } from "./lib/branding";
+import { cleanupExpiredOAuthState } from "./utils/oauth";
 
-const App = observer(() => {
-  const { i18n } = useTranslation();
+const App = () => {
   const navigateTo = useNavigateTo();
-  const workspaceProfile = workspaceStore.state.profile;
-  const userGeneralSetting = userStore.state.userGeneralSetting;
-  const workspaceGeneralSetting = workspaceStore.state.generalSetting;
+  const { profile: instanceProfile, profileLoaded, generalSetting: instanceGeneralSetting } = useInstance();
 
-  // Redirect to sign up page if no instance owner.
+  // Apply user preferences reactively
+  const direction = useUserLocale();
+  useUserTheme();
+
+  // Clean up expired OAuth states on app initialization
   useEffect(() => {
-    if (!workspaceProfile.owner) {
+    cleanupExpiredOAuthState();
+  }, []);
+
+  // Redirect to sign up page if the instance needs initial setup (no users yet).
+  // needsSetup is used instead of a missing admin so an instance that has lost its
+  // admins isn't mistaken for a fresh install (which would create a normal user).
+  // Guard with profileLoaded so a fetch failure doesn't incorrectly trigger the redirect.
+  useEffect(() => {
+    if (profileLoaded && instanceProfile.needsSetup) {
       navigateTo("/auth/signup");
     }
-  }, [workspaceProfile.owner]);
+  }, [profileLoaded, instanceProfile.needsSetup, navigateTo]);
 
   useEffect(() => {
-    if (workspaceGeneralSetting.additionalStyle) {
+    if (instanceGeneralSetting.additionalStyle) {
       const styleEl = document.createElement("style");
-      styleEl.innerHTML = workspaceGeneralSetting.additionalStyle;
+      styleEl.innerHTML = instanceGeneralSetting.additionalStyle;
       styleEl.setAttribute("type", "text/css");
       document.body.insertAdjacentElement("beforeend", styleEl);
     }
-  }, [workspaceGeneralSetting.additionalStyle]);
+  }, [instanceGeneralSetting.additionalStyle]);
 
   useEffect(() => {
-    if (workspaceGeneralSetting.additionalScript) {
+    if (instanceGeneralSetting.additionalScript) {
       const scriptEl = document.createElement("script");
-      scriptEl.innerHTML = workspaceGeneralSetting.additionalScript;
+      scriptEl.innerHTML = instanceGeneralSetting.additionalScript;
       document.head.appendChild(scriptEl);
     }
-  }, [workspaceGeneralSetting.additionalScript]);
+  }, [instanceGeneralSetting.additionalScript]);
 
-  // Dynamic update metadata with customized profile.
+  // Dynamic update metadata with customized profile
   useEffect(() => {
-    if (!workspaceGeneralSetting.customProfile) {
+    const customProfile = instanceGeneralSetting.customProfile;
+    document.title = customProfile?.title || "Memos";
+    const link = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+    if (!link) return;
+
+    const logoUrl = getCustomLogoUrl(customProfile?.logoUrl);
+    if (logoUrl) {
+      link.href = logoUrl;
+      // Custom images may be PNG, JPEG, or SVG; let the browser detect their type.
+      link.removeAttribute("type");
       return;
     }
 
-    document.title = workspaceGeneralSetting.customProfile.title;
-    const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
-    link.href = workspaceGeneralSetting.customProfile.logoUrl || "/logo.webp";
-  }, [workspaceGeneralSetting.customProfile]);
+    // A fixed blue stays visible when browser chrome differs from the system theme.
+    link.href = DEFAULT_FAVICON;
+    link.type = "image/svg+xml";
+  }, [instanceGeneralSetting.customProfile]);
 
-  useEffect(() => {
-    const currentLocale = workspaceStore.state.locale;
-    // This will trigger re-rendering of the whole app.
-    i18n.changeLanguage(currentLocale);
-    document.documentElement.setAttribute("lang", currentLocale);
-    if (["ar", "fa"].includes(currentLocale)) {
-      document.documentElement.setAttribute("dir", "rtl");
-    } else {
-      document.documentElement.setAttribute("dir", "ltr");
-    }
-  }, [workspaceStore.state.locale]);
-
-  useEffect(() => {
-    if (!userGeneralSetting) {
-      return;
-    }
-
-    workspaceStore.state.setPartial({
-      locale: userGeneralSetting.locale || workspaceStore.state.locale,
-      theme: userGeneralSetting.theme || workspaceStore.state.theme,
-    });
-  }, [userGeneralSetting?.locale, userGeneralSetting?.theme]);
-
-  // Load theme when workspace theme changes or user setting changes
-  useEffect(() => {
-    const currentTheme = userGeneralSetting?.theme || workspaceStore.state.theme;
-    if (currentTheme) {
-      loadTheme(currentTheme);
-    }
-  }, [userGeneralSetting?.theme, workspaceStore.state.theme]);
-
-  return <Outlet />;
-});
+  return (
+    <DirectionProvider direction={direction}>
+      <TimelineViewProvider>
+        <Outlet />
+      </TimelineViewProvider>
+      <ScrollRestoration />
+    </DirectionProvider>
+  );
+};
 
 export default App;

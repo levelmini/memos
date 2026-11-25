@@ -1,0 +1,121 @@
+import { isValidElement } from "react";
+import { matchRoutes, type RouteObject } from "react-router-dom";
+import { describe, expect, it } from "vitest";
+import MainLayout from "@/layouts/MainLayout";
+import { ROUTES, routeConfig } from "@/router";
+import { RequireAuthRoute, RequireFullInitializationRoute, RequireGuestRoute, RequireInstanceInitializationRoute } from "@/router/guards";
+import { CALENDAR_ROUTE_PATTERN, SPACE_ROUTE_PATTERN } from "@/router/routes";
+import { SpaceRoute } from "@/router/SpaceRoute";
+
+// Walk the nested route config and find the first route with the given path,
+// starting from the provided roots. Returns undefined if nothing matches.
+function findByPath(routes: RouteObject[], path: string): RouteObject | undefined {
+  for (const route of routes) {
+    if (route.path === path) return route;
+    const hit = route.children ? findByPath(route.children, path) : undefined;
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+function elementType(route: RouteObject | undefined): unknown {
+  if (!route?.element || !isValidElement(route.element)) return undefined;
+  return route.element.type;
+}
+
+function hasAncestorOfType(routes: RouteObject[], path: string, guardType: unknown): boolean {
+  const walk = (subtree: RouteObject[], ancestorGuards: unknown[]): boolean => {
+    for (const route of subtree) {
+      const nextAncestors = [...ancestorGuards];
+      const type = elementType(route);
+      if (type) nextAncestors.push(type);
+      if (route.path === path) {
+        return nextAncestors.includes(guardType);
+      }
+      if (route.children && walk(route.children, nextAncestors)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return walk(routes, []);
+}
+
+describe("router configuration", () => {
+  it("uses the same page gutters for the timeline, memo details, and shared memos", () => {
+    for (const path of [ROUTES.EXPLORE, "memos/:uid", "memos/shares/:token"]) {
+      expect(hasAncestorOfType(routeConfig, path, MainLayout)).toBe(true);
+    }
+  });
+
+  it.each([
+    "/spaces/product",
+    "/spaces/product/calendar/2026/09",
+    "/spaces/product/attachments",
+  ])("gates %s with authentication and Space access", (path) => {
+    const types = matchRoutes(routeConfig, path)?.map(({ route }) => elementType(route));
+    expect(types).toContain(RequireAuthRoute);
+    expect(types).toContain(SpaceRoute);
+    expect(findByPath(routeConfig, SPACE_ROUTE_PATTERN)).toBeDefined();
+  });
+  // A Space has one timeline, so it has no Explore page of its own.
+  it.each(["/spaces/product/unknown", "/spaces/product/explore"])("keeps %s outside collection pages", (path) => {
+    const matches = matchRoutes(routeConfig, path);
+    expect(matches?.at(-1)?.route.path).toBe("*");
+    expect(matches?.map(({ route }) => elementType(route))).not.toContain(SpaceRoute);
+  });
+
+  it("keeps /auth/callback outside the guest-only guard", () => {
+    // Regression guard for issue #5846 follow-up: an authenticated tab elsewhere
+    // must not short-circuit the OAuth callback via RequireGuestRoute.
+    expect(hasAncestorOfType(routeConfig, "callback", RequireGuestRoute)).toBe(false);
+  });
+
+  it("wraps the remaining /auth children in RequireGuestRoute", () => {
+    for (const path of ["", "admin", "signup"]) {
+      expect(hasAncestorOfType(routeConfig, path, RequireGuestRoute)).toBe(true);
+      expect(hasAncestorOfType(routeConfig, path, RequireInstanceInitializationRoute)).toBe(true);
+    }
+  });
+
+  it("wraps authenticated-only pages in RequireAuthRoute", () => {
+    for (const path of [ROUTES.ARCHIVED, ROUTES.VIEWS, ROUTES.ATTACHMENTS, ROUTES.INBOX, ROUTES.SETTING]) {
+      expect(hasAncestorOfType(routeConfig, path, RequireAuthRoute)).toBe(true);
+    }
+  });
+
+  it("keeps non-feed pages behind their full initialization requirements", () => {
+    for (const path of [ROUTES.VIEWS, ROUTES.ATTACHMENTS, ROUTES.MAP, ROUTES.INBOX, ROUTES.SETTING]) {
+      expect(hasAncestorOfType(routeConfig, path, RequireFullInitializationRoute)).toBe(true);
+    }
+    expect(hasAncestorOfType(routeConfig, ROUTES.ABOUT, RequireInstanceInitializationRoute)).toBe(true);
+  });
+
+  it("does not register a dedicated new memo route", () => {
+    expect(findByPath(routeConfig, "/new")).toBeUndefined();
+  });
+
+  it("leaves memo feeds available for early queries", () => {
+    for (const path of [ROUTES.EXPLORE, ROUTES.ARCHIVED, CALENDAR_ROUTE_PATTERN, "memos/:uid", "memos/shares/:token", "u/:username"]) {
+      expect(hasAncestorOfType(routeConfig, path, RequireFullInitializationRoute)).toBe(false);
+    }
+  });
+
+  it("leaves public pages outside RequireAuthRoute", () => {
+    for (const path of [
+      ROUTES.ABOUT,
+      ROUTES.EXPLORE,
+      CALENDAR_ROUTE_PATTERN,
+      ROUTES.MAP,
+      "memos/:uid",
+      "memos/shares/:token",
+      "u/:username",
+    ]) {
+      expect(hasAncestorOfType(routeConfig, path, RequireAuthRoute)).toBe(false);
+    }
+  });
+
+  it("exposes an accessible /auth/callback route definition", () => {
+    expect(findByPath(routeConfig, "callback")).toBeTruthy();
+  });
+});

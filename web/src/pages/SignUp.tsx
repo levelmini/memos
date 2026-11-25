@@ -1,44 +1,52 @@
-import { LoaderIcon } from "lucide-react";
-import { observer } from "mobx-react-lite";
-import { ClientError } from "nice-grpc-web";
+import { create } from "@bufbuild/protobuf";
+import { timestampDate } from "@bufbuild/protobuf/wkt";
+import { Button } from "@usememos/ui";
 import { useState } from "react";
-import { toast } from "react-hot-toast";
-import { Link } from "react-router-dom";
-import AuthFooter from "@/components/AuthFooter";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { authServiceClient, userServiceClient } from "@/grpcweb";
+import { Navigate, useSearchParams } from "react-router-dom";
+import { setAccessToken } from "@/auth-state";
+import AuthNotice from "@/components/AuthNotice";
+import AuthPageLayout, { AuthLinkPrompt } from "@/components/AuthPageLayout";
+import ChallengeWidget, { CHALLENGE_TOKEN_HEADER } from "@/components/ChallengeWidget";
+import CredentialFields from "@/components/CredentialFields";
+import { authServiceClient, userServiceClient } from "@/connect";
+import { useAuth } from "@/contexts/AuthContext";
+import { useInstance } from "@/contexts/InstanceContext";
 import useLoading from "@/hooks/useLoading";
 import useNavigateTo from "@/hooks/useNavigateTo";
-import { workspaceStore } from "@/store";
-import { initialUserStore } from "@/store/user";
-import { User, User_Role } from "@/types/proto/api/v1/user_service";
+import { ERROR_REASON_CHALLENGE_REQUIRED, getErrorMessage, hasErrorReason } from "@/lib/error";
+import { ROUTES } from "@/router/routes";
+import { User_Role, UserSchema } from "@/types/proto/api/user_service_pb";
+import {
+  AUTH_REASON_PARAM,
+  AUTH_REASON_SIGNUPS_CLOSED,
+  AUTH_REDIRECT_PARAM,
+  appendSearchParams,
+  getSafeRedirectPath,
+} from "@/utils/auth-redirect";
 import { useTranslate } from "@/utils/i18n";
 
-const SignUp = observer(() => {
+const SignUp = () => {
   const t = useTranslate();
   const navigateTo = useNavigateTo();
   const actionBtnLoadingState = useLoading(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const workspaceGeneralSetting = workspaceStore.state.generalSetting;
+  const [errorMessage, setErrorMessage] = useState("");
+  const [challengeToken, setChallengeToken] = useState<string | null>(null);
+  const [challengeResetKey, setChallengeResetKey] = useState(0);
+  const { initialize: initAuth } = useAuth();
+  const { generalSetting: instanceGeneralSetting, profile, initialize: initInstance } = useInstance();
+  const [searchParams] = useSearchParams();
+  const redirectTarget = getSafeRedirectPath(searchParams.get(AUTH_REDIRECT_PARAM));
+  const signInPath = appendSearchParams(ROUTES.AUTH, searchParams);
 
-  const handleUsernameInputChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const text = e.target.value as string;
-    setUsername(text);
-  };
+  const passwordAuthAllowed = !instanceGeneralSetting.disallowPasswordAuth;
+  const registrationOpen = !instanceGeneralSetting.disallowUserRegistration;
+  const needsSetup = profile.needsSetup;
 
-  const handlePasswordInputChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const text = e.target.value as string;
-    setPassword(text);
-  };
-
-  const handleFormSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleFormSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    handleSignUpButtonClick();
-  };
 
-  const handleSignUpButtonClick = async () => {
     if (username === "" || password === "") {
       return;
     }
@@ -49,92 +57,85 @@ const SignUp = observer(() => {
 
     try {
       actionBtnLoadingState.setLoading();
-      const user = User.fromPartial({
+      setErrorMessage("");
+      const user = create(UserSchema, {
         username,
         password,
         role: User_Role.USER,
       });
-      await userServiceClient.createUser({ user });
-      await authServiceClient.createSession({
-        passwordCredentials: { username, password },
-      });
-      await initialUserStore();
-      navigateTo("/");
-    } catch (error: any) {
+      // The token is spent by createUser; the sign-in that follows is not a
+      // credential guess, and the server does not ask for a second one there.
+      const callOptions = challengeToken ? { headers: { [CHALLENGE_TOKEN_HEADER]: challengeToken } } : undefined;
+      await userServiceClient.createUser({ user }, callOptions);
+      const response = await authServiceClient.signIn(
+        {
+          credentials: {
+            case: "passwordCredentials",
+            value: { username, password },
+          },
+        },
+        callOptions,
+      );
+      // Store access token from login response
+      if (response.accessToken) {
+        setAccessToken(response.accessToken, response.accessTokenExpireTime ? timestampDate(response.accessTokenExpireTime) : undefined);
+      }
+      // Refresh auth context to load the current user
+      await initAuth();
+      // Refetch instance profile to update the initialized status
+      await initInstance();
+      navigateTo(redirectTarget || ROUTES.HOME, { replace: true });
+    } catch (error: unknown) {
       console.error(error);
-      toast.error((error as ClientError).details || "Sign up failed");
+      if (hasErrorReason(error, ERROR_REASON_CHALLENGE_REQUIRED)) {
+        setChallengeResetKey((key) => key + 1);
+      }
+      setErrorMessage(getErrorMessage(error, t("error.sign-up-failed")));
     }
     actionBtnLoadingState.setFinish();
   };
 
+  // Without password accounts, an identity provider creates the account on first sign-in, so sign-up is sign-in.
+  if (!needsSetup && (!registrationOpen || !passwordAuthAllowed)) {
+    const params = new URLSearchParams(searchParams);
+    if (!registrationOpen) {
+      params.set(AUTH_REASON_PARAM, AUTH_REASON_SIGNUPS_CLOSED);
+    }
+    return <Navigate to={appendSearchParams(ROUTES.AUTH, params)} replace />;
+  }
+
+  const submitLabel = needsSetup ? t("auth.create-admin-account") : t("common.sign-up");
+
   return (
-    <div className="py-4 sm:py-8 w-80 max-w-full min-h-svh mx-auto flex flex-col justify-start items-center">
-      <div className="w-full py-4 grow flex flex-col justify-center items-center">
-        <div className="w-full flex flex-row justify-center items-center mb-6">
-          <img className="h-14 w-auto rounded-full shadow" src={workspaceGeneralSetting.customProfile?.logoUrl || "/logo.webp"} alt="" />
-          <p className="ml-2 text-5xl text-foreground opacity-80">{workspaceGeneralSetting.customProfile?.title || "Memos"}</p>
-        </div>
-        {!workspaceGeneralSetting.disallowUserRegistration ? (
-          <>
-            <p className="w-full text-2xl mt-2 text-muted-foreground">{t("auth.create-your-account")}</p>
-            <form className="w-full mt-2" onSubmit={handleFormSubmit}>
-              <div className="flex flex-col justify-start items-start w-full gap-4">
-                <div className="w-full flex flex-col justify-start items-start">
-                  <span className="leading-8 text-muted-foreground">{t("common.username")}</span>
-                  <Input
-                    className="w-full bg-background h-10"
-                    type="text"
-                    readOnly={actionBtnLoadingState.isLoading}
-                    placeholder={t("common.username")}
-                    value={username}
-                    autoComplete="username"
-                    autoCapitalize="off"
-                    spellCheck={false}
-                    onChange={handleUsernameInputChanged}
-                    required
-                  />
-                </div>
-                <div className="w-full flex flex-col justify-start items-start">
-                  <span className="leading-8 text-muted-foreground">{t("common.password")}</span>
-                  <Input
-                    className="w-full bg-background h-10"
-                    type="password"
-                    readOnly={actionBtnLoadingState.isLoading}
-                    placeholder={t("common.password")}
-                    value={password}
-                    autoComplete="password"
-                    autoCapitalize="off"
-                    spellCheck={false}
-                    onChange={handlePasswordInputChanged}
-                    required
-                  />
-                </div>
-              </div>
-              <div className="flex flex-row justify-end items-center w-full mt-6">
-                <Button type="submit" className="w-full h-10" disabled={actionBtnLoadingState.isLoading} onClick={handleSignUpButtonClick}>
-                  {t("common.sign-up")}
-                  {actionBtnLoadingState.isLoading && <LoaderIcon className="w-5 h-auto ml-2 animate-spin opacity-60" />}
-                </Button>
-              </div>
-            </form>
-          </>
-        ) : (
-          <p className="w-full text-2xl mt-2 text-muted-foreground">Sign up is not allowed.</p>
-        )}
-        {!workspaceStore.state.profile.owner ? (
-          <p className="w-full mt-4 text-sm font-medium text-muted-foreground">{t("auth.host-tip")}</p>
-        ) : (
-          <p className="w-full mt-4 text-sm">
-            <span className="text-muted-foreground">{t("auth.sign-in-tip")}</span>
-            <Link to="/auth" className="cursor-pointer ml-2 text-primary hover:underline" viewTransition>
-              {t("common.sign-in")}
-            </Link>
-          </p>
-        )}
-      </div>
-      <AuthFooter />
-    </div>
+    <AuthPageLayout
+      title={needsSetup ? t("auth.setup-title") : t("auth.create-your-account")}
+      description={needsSetup ? t("auth.setup-description") : undefined}
+    >
+      <form className="flex w-full flex-col gap-4" onSubmit={handleFormSubmit}>
+        <CredentialFields
+          idPrefix="signup"
+          username={username}
+          password={password}
+          passwordAutoComplete="new-password"
+          readOnly={actionBtnLoadingState.isLoading}
+          onUsernameChange={(value) => {
+            setUsername(value);
+            setErrorMessage("");
+          }}
+          onPasswordChange={(value) => {
+            setPassword(value);
+            setErrorMessage("");
+          }}
+        />
+        {!needsSetup && <ChallengeWidget onToken={setChallengeToken} resetKey={challengeResetKey} />}
+        {errorMessage && <AuthNotice tone="error">{errorMessage}</AuthNotice>}
+        <Button variant="primary" type="submit" loading={actionBtnLoadingState.isLoading} loadingLabel={submitLabel}>
+          {submitLabel}
+        </Button>
+      </form>
+      {!needsSetup && <AuthLinkPrompt prompt={t("auth.sign-in-tip")} to={signInPath} label={t("common.sign-in")} />}
+    </AuthPageLayout>
   );
-});
+};
 
 export default SignUp;

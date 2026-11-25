@@ -11,6 +11,7 @@ import (
 
 type IdentityProvider struct {
 	ID               int32
+	UID              string
 	Name             string
 	Type             storepb.IdentityProvider_Type
 	IdentifierFilter string
@@ -18,7 +19,8 @@ type IdentityProvider struct {
 }
 
 type FindIdentityProvider struct {
-	ID *int32
+	ID  *int32
+	UID *string
 }
 
 type UpdateIdentityProvider struct {
@@ -75,7 +77,7 @@ func (s *Store) GetIdentityProvider(ctx context.Context, find *FindIdentityProvi
 		return nil, nil
 	}
 	if len(list) > 1 {
-		return nil, errors.Errorf("Found multiple identity providers with ID %d", *find.ID)
+		return nil, errors.New("found multiple identity providers")
 	}
 
 	identityProvider := list[0]
@@ -130,6 +132,7 @@ func (s *Store) DeleteIdentityProvider(ctx context.Context, delete *DeleteIdenti
 func convertIdentityProviderFromRaw(raw *IdentityProvider) (*storepb.IdentityProvider, error) {
 	identityProvider := &storepb.IdentityProvider{
 		Id:               raw.ID,
+		Uid:              raw.UID,
 		Name:             raw.Name,
 		Type:             raw.Type,
 		IdentifierFilter: raw.IdentifierFilter,
@@ -145,6 +148,7 @@ func convertIdentityProviderFromRaw(raw *IdentityProvider) (*storepb.IdentityPro
 func convertIdentityProviderToRaw(identityProvider *storepb.IdentityProvider) (*IdentityProvider, error) {
 	raw := &IdentityProvider{
 		ID:               identityProvider.Id,
+		UID:              identityProvider.Uid,
 		Name:             identityProvider.Name,
 		Type:             identityProvider.Type,
 		IdentifierFilter: identityProvider.IdentifierFilter,

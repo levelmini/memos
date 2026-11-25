@@ -2,70 +2,147 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/encoding/protojson"
 
-	"github.com/usememos/memos/plugin/filter"
+	"github.com/usememos/memos/filter"
 	storepb "github.com/usememos/memos/proto/gen/store"
 	"github.com/usememos/memos/store"
 )
 
 func (d *DB) CreateMemo(ctx context.Context, create *store.Memo) (*store.Memo, error) {
-	fields := []string{"uid", "creator_id", "content", "visibility", "payload"}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := validatePostgresMemoCreate(ctx, tx, create); err != nil {
+		return nil, err
+	}
+	if err := insertPostgresMemo(ctx, tx, create); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return create, nil
+}
+
+func insertPostgresMemo(ctx context.Context, tx *sql.Tx, create *store.Memo) error {
+	fields := []string{"uid", "creator_id", "content", "visibility", "payload", "space_id"}
 	payload := "{}"
 	if create.Payload != nil {
 		payloadBytes, err := protojson.Marshal(create.Payload)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		payload = string(payloadBytes)
 	}
-	args := []any{create.UID, create.CreatorID, create.Content, create.Visibility, payload}
+	args := []any{create.UID, create.CreatorID, create.Content, create.Visibility, payload, create.SpaceID}
+
+	// Add custom timestamps if provided
+	if create.CreatedTs != 0 {
+		fields = append(fields, "created_ts")
+		args = append(args, create.CreatedTs)
+	}
+	if create.UpdatedTs != 0 {
+		fields = append(fields, "updated_ts")
+		args = append(args, create.UpdatedTs)
+	}
 
 	stmt := "INSERT INTO memo (" + strings.Join(fields, ", ") + ") VALUES (" + placeholders(len(args)) + ") RETURNING id, created_ts, updated_ts, row_status"
-	if err := d.db.QueryRowContext(ctx, stmt, args...).Scan(
+	if err := tx.QueryRowContext(ctx, stmt, args...).Scan(
 		&create.ID,
 		&create.CreatedTs,
 		&create.UpdatedTs,
 		&create.RowStatus,
 	); err != nil {
-		return nil, err
+		return err
 	}
+	return nil
+}
 
-	return create, nil
+func validatePostgresMemoCreate(ctx context.Context, tx *sql.Tx, create *store.Memo) error {
+	actor, err := readPostgresMemoActor(ctx, tx, create.CreatorID)
+	if err != nil {
+		return err
+	}
+	if !actor.Active {
+		return store.ErrMemoSpaceMembershipRequired
+	}
+	if create.SpaceID == nil {
+		return nil
+	}
+	if !actor.Admin {
+		return validatePostgresMemoSpaceMember(ctx, tx, *create.SpaceID, create.CreatorID)
+	}
+	// An instance administrator places memos without membership; the target
+	// Space must still exist.
+	exists, err := postgresSpaceExists(ctx, tx, *create.SpaceID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return store.ErrMemoSpaceNotWritable
+	}
+	return nil
+}
+
+func validatePostgresMemoSpaceMember(ctx context.Context, tx *sql.Tx, spaceID, userID int32) error {
+	var spaceExists, memberActive bool
+	err := tx.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM space WHERE id = $1),
+		EXISTS(SELECT 1 FROM space_member sm JOIN "user" u ON u.id = sm.user_id
+			WHERE sm.space_id = $1 AND sm.user_id = $2 AND sm.status = 'ACTIVE'
+				AND sm.role IN ('ADMIN', 'USER') AND u.row_status = 'NORMAL')`,
+		spaceID, userID).Scan(&spaceExists, &memberActive)
+	if err != nil {
+		return err
+	}
+	if !spaceExists {
+		return store.ErrMemoSpaceNotWritable
+	}
+	if !memberActive {
+		return store.ErrMemoSpaceMembershipRequired
+	}
+	return nil
 }
 
 func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo, error) {
 	where, args := []string{"1 = 1"}, []any{}
 
-	for _, filterStr := range find.Filters {
-		// Parse filter string and return the parsed expression.
-		// The filter string should be a CEL expression.
-		parsedExpr, err := filter.Parse(filterStr, filter.MemoFilterCELAttributes...)
-		if err != nil {
-			return nil, err
-		}
-		convertCtx := filter.NewConvertContext()
-		convertCtx.ArgsOffset = len(args)
-		// ConvertExprToSQL converts the parsed expression to a SQL condition string.
-		converter := filter.NewCommonSQLConverterWithOffset(&filter.PostgreSQLDialect{}, convertCtx.ArgsOffset+len(convertCtx.Args))
-		if err := converter.ConvertExprToSQL(convertCtx, parsedExpr.GetExpr()); err != nil {
-			return nil, err
-		}
-		condition := convertCtx.Buffer.String()
-		if condition != "" {
-			where = append(where, fmt.Sprintf("(%s)", condition))
-			args = append(args, convertCtx.Args...)
-		}
+	engine, err := filter.DefaultEngine()
+	if err != nil {
+		return nil, err
+	}
+	if err := filter.AppendConditions(ctx, engine, find.Filters, filter.DialectPostgres, &where, &args); err != nil {
+		return nil, err
 	}
 	if v := find.ID; v != nil {
 		where, args = append(where, "memo.id = "+placeholder(len(args)+1)), append(args, *v)
 	}
+	if len(find.IDList) > 0 {
+		holders := make([]string, 0, len(find.IDList))
+		for _, id := range find.IDList {
+			holders = append(holders, placeholder(len(args)+1))
+			args = append(args, id)
+		}
+		where = append(where, "memo.id IN ("+strings.Join(holders, ", ")+")")
+	}
 	if v := find.UID; v != nil {
 		where, args = append(where, "memo.uid = "+placeholder(len(args)+1)), append(args, *v)
+	}
+	if len(find.UIDList) > 0 {
+		holders := make([]string, 0, len(find.UIDList))
+		for _, uid := range find.UIDList {
+			holders = append(holders, placeholder(len(args)+1))
+			args = append(args, uid)
+		}
+		where = append(where, "memo.uid IN ("+strings.Join(holders, ", ")+")")
 	}
 	if v := find.CreatorID; v != nil {
 		where, args = append(where, "memo.creator_id = "+placeholder(len(args)+1)), append(args, *v)
@@ -81,8 +158,24 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 		}
 		where = append(where, fmt.Sprintf("memo.visibility in (%s)", strings.Join(holders, ", ")))
 	}
+	if v := find.CommentContextMemoID; v != nil {
+		contextHolder := placeholder(len(args) + 1)
+		args = append(args, *v)
+		where = append(where, `EXISTS (
+			SELECT 1 FROM memo_relation AS comment_context
+			WHERE comment_context.memo_id = memo.id
+				AND comment_context.related_memo_id = `+contextHolder+`
+				AND comment_context.type = 'COMMENT'
+		)`)
+	}
+	if access := find.Access; access != nil {
+		where = append(where, postgresMemoAccessPredicate(access, "memo", "access_member", &args))
+	}
 	if find.ExcludeComments {
-		where = append(where, "memo_relation.related_memo_id IS NULL")
+		where = append(where, `NOT EXISTS (
+			SELECT 1 FROM memo_relation AS comment_relation
+			WHERE comment_relation.memo_id = memo.id AND comment_relation.type = 'COMMENT'
+		)`)
 	}
 
 	order := "DESC"
@@ -90,11 +183,16 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 		order = "ASC"
 	}
 	orderBy := []string{}
+	if find.OrderByPinned {
+		orderBy = append(orderBy, "pinned DESC")
+	}
 	if find.OrderByUpdatedTs {
 		orderBy = append(orderBy, "updated_ts "+order)
 	} else {
 		orderBy = append(orderBy, "created_ts "+order)
 	}
+	// Add id as final tie-breaker
+	orderBy = append(orderBy, "id DESC")
 	fields := []string{
 		`memo.id AS id`,
 		`memo.uid AS uid`,
@@ -105,7 +203,12 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 		`memo.visibility AS visibility`,
 		`memo.pinned AS pinned`,
 		`memo.payload AS payload`,
-		`CASE WHEN parent_memo.uid IS NOT NULL THEN parent_memo.uid ELSE NULL END AS parent_uid`,
+		`memo.space_id AS space_id`,
+		`(SELECT parent_memo.uid
+			FROM memo_relation AS parent_relation
+			JOIN memo AS parent_memo ON parent_memo.id = parent_relation.related_memo_id
+			WHERE parent_relation.memo_id = memo.id AND parent_relation.type = 'COMMENT'
+			ORDER BY parent_memo.id LIMIT 1) AS parent_uid`,
 	}
 	if !find.ExcludeContent {
 		fields = append(fields, `memo.content AS content`)
@@ -113,8 +216,8 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 
 	query := `SELECT ` + strings.Join(fields, ", ") + `
 		FROM memo
-		LEFT JOIN memo_relation ON memo.id = memo_relation.memo_id AND memo_relation.type = 'COMMENT'
-		LEFT JOIN memo AS parent_memo ON memo_relation.related_memo_id = parent_memo.id
+		LEFT JOIN "user" AS memo_creator ON memo.creator_id = memo_creator.id
+		LEFT JOIN space AS memo_space ON memo.space_id = memo_space.id
 		WHERE ` + strings.Join(where, " AND ") + `
 		ORDER BY ` + strings.Join(orderBy, ", ")
 	if find.Limit != nil {
@@ -144,6 +247,7 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 			&memo.Visibility,
 			&memo.Pinned,
 			&payloadBytes,
+			&memo.SpaceID,
 			&memo.ParentUID,
 		}
 		if !find.ExcludeContent {
@@ -180,57 +284,68 @@ func (d *DB) GetMemo(ctx context.Context, find *store.FindMemo) (*store.Memo, er
 	return memo, nil
 }
 
-func (d *DB) UpdateMemo(ctx context.Context, update *store.UpdateMemo) error {
-	set, args := []string{}, []any{}
-	if v := update.UID; v != nil {
-		set, args = append(set, "uid = "+placeholder(len(args)+1)), append(args, *v)
+// CountUserMemos counts the memos a user created, comments included, in every
+// row status and Space.
+func (d *DB) CountUserMemos(ctx context.Context, creatorID int32) (int64, error) {
+	stmt := `SELECT COUNT(*) FROM memo WHERE creator_id = $1`
+	var count int64
+	if err := d.db.QueryRowContext(ctx, stmt, creatorID).Scan(&count); err != nil {
+		return 0, errors.Wrap(err, "failed to count user memos")
 	}
-	if v := update.CreatedTs; v != nil {
-		set, args = append(set, "created_ts = "+placeholder(len(args)+1)), append(args, *v)
-	}
-	if v := update.UpdatedTs; v != nil {
-		set, args = append(set, "updated_ts = "+placeholder(len(args)+1)), append(args, *v)
-	}
-	if v := update.RowStatus; v != nil {
-		set, args = append(set, "row_status = "+placeholder(len(args)+1)), append(args, *v)
-	}
-	if v := update.Content; v != nil {
-		set, args = append(set, "content = "+placeholder(len(args)+1)), append(args, *v)
-	}
-	if v := update.Visibility; v != nil {
-		set, args = append(set, "visibility = "+placeholder(len(args)+1)), append(args, *v)
-	}
-	if v := update.Pinned; v != nil {
-		set, args = append(set, "pinned = "+placeholder(len(args)+1)), append(args, *v)
-	}
-	if v := update.Payload; v != nil {
-		payloadBytes, err := protojson.Marshal(v)
-		if err != nil {
-			return err
-		}
-		set, args = append(set, "payload = "+placeholder(len(args)+1)), append(args, string(payloadBytes))
-	}
-	if len(set) == 0 {
-		return nil
-	}
+	return count, nil
+}
 
-	stmt := `UPDATE memo SET ` + strings.Join(set, ", ") + ` WHERE id = ` + placeholder(len(args)+1)
-	args = append(args, update.ID)
-	if _, err := d.db.ExecContext(ctx, stmt, args...); err != nil {
+func (d *DB) UpdateMemo(ctx context.Context, update *store.UpdateMemo) error {
+	if update.Policy == nil {
+		return applyMemoUpdate(ctx, d.db, update)
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := validatePostgresMemoWritePolicy(ctx, tx, update.ID, update.Policy, update); err != nil {
+		return err
+	}
+	if err := applyMemoUpdate(ctx, tx, update); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) DeleteMemo(ctx context.Context, delete *store.DeleteMemo) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to start memo delete transaction")
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if _, err := tx.ExecContext(ctx, "DELETE FROM memo WHERE id = "+placeholder(1), delete.ID); err != nil {
+		return errors.Wrap(err, "failed to delete memo")
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM reaction WHERE memo_id = "+placeholder(1), delete.ID); err != nil {
+		return errors.Wrap(err, "failed to delete memo reactions")
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "failed to commit memo delete transaction")
 	}
 	return nil
 }
 
-func (d *DB) DeleteMemo(ctx context.Context, delete *store.DeleteMemo) error {
-	where, args := []string{"id = " + placeholder(1)}, []any{delete.ID}
-	stmt := `DELETE FROM memo WHERE ` + strings.Join(where, " AND ")
-	result, err := d.db.ExecContext(ctx, stmt, args...)
+// RefreshMemoDerivedPayload sets the payload's tags and property while the
+// content is unchanged; jsonb_set keeps every other payload key.
+func (d *DB) RefreshMemoDerivedPayload(ctx context.Context, refresh *store.RefreshMemoDerivedPayload) error {
+	tags, property, err := refresh.JSON()
 	if err != nil {
-		return errors.Wrap(err, "failed to delete memo")
-	}
-	if _, err := result.RowsAffected(); err != nil {
 		return err
+	}
+	if _, err := d.db.ExecContext(ctx,
+		"UPDATE memo SET payload = jsonb_set(jsonb_set(COALESCE(payload, '{}'::jsonb), '{tags}', "+placeholder(1)+"::jsonb), '{property}', "+placeholder(2)+"::jsonb) WHERE id = "+placeholder(3)+" AND content = "+placeholder(4),
+		tags, property, refresh.ID, refresh.Content,
+	); err != nil {
+		return errors.Wrap(err, "failed to refresh memo payload")
 	}
 	return nil
 }

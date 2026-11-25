@@ -1,179 +1,303 @@
-import { ArrowUpLeftFromCircleIcon, MessageCircleIcon } from "lucide-react";
-import { observer } from "mobx-react-lite";
-import { ClientError } from "nice-grpc-web";
-import { useEffect, useState } from "react";
-import { toast } from "react-hot-toast";
-import { Link, useLocation, useParams } from "react-router-dom";
-import { MemoDetailSidebar, MemoDetailSidebarDrawer } from "@/components/MemoDetailSidebar";
-import MemoEditor from "@/components/MemoEditor";
-import MemoView from "@/components/MemoView";
-import MobileHeader from "@/components/MobileHeader";
-import { Button } from "@/components/ui/button";
-import useCurrentUser from "@/hooks/useCurrentUser";
-import useNavigateTo from "@/hooks/useNavigateTo";
-import useResponsiveWidth from "@/hooks/useResponsiveWidth";
-import { cn } from "@/lib/utils";
-import { memoStore } from "@/store";
-import { memoNamePrefix } from "@/store/common";
-import { Memo, MemoRelation_Type } from "@/types/proto/api/v1/memo_service";
+import { Code, ConnectError } from "@connectrpc/connect";
+import { ArrowUpLeftFromCircleIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo as useReactMemo, useRef, useState } from "react";
+import { Link, Navigate, useLocation, useParams } from "react-router-dom";
+import MemoCommentSection, { type MemoCommentSectionHandle } from "@/components/MemoCommentSection";
+import MemoParentPlaceholder, { type MemoParentStatus } from "@/components/MemoParentPlaceholder";
+import MemoView, { type MemoViewHandle } from "@/components/MemoView";
+import { createMemoNavigationState, resolveMemoDetailOrigin } from "@/components/MemoView/navigation";
+import { useAppSidebar } from "@/contexts/AppSidebarContext";
+import { useAuth } from "@/contexts/AuthContext";
+import { useInstance } from "@/contexts/InstanceContext";
+import { MentionResolutionProvider } from "@/contexts/MentionResolutionContext";
+import useMemoDetailError from "@/hooks/useMemoDetailError";
+import { useInfiniteMemoComments, useMemo } from "@/hooks/useMemoQueries";
+import { useSharedMemo, withShareAttachmentLinks } from "@/hooks/useMemoShareQueries";
+import { LEGACY_MEMO_COMMENTS_ANCHOR_ID, MEMO_COMMENTS_ANCHOR_ID } from "@/lib/memo-comments";
+import { memoNamePrefix } from "@/lib/resource-names";
+import { isMemoBlurred } from "@/lib/tag";
+import { ROUTES } from "@/router/routes";
+import type { Attachment } from "@/types/proto/api/attachment_service_pb";
+import { State } from "@/types/proto/api/common_pb";
+import type { Memo } from "@/types/proto/api/memo_service_pb";
 import { useTranslate } from "@/utils/i18n";
+import { findMemoAnchorTarget } from "@/utils/markdown-manipulation";
 
-const MemoDetail = observer(() => {
+const MemoSidebarRegistration = ({
+  memo,
+  parentMemo,
+  parentStatus,
+  onParentRetry,
+  from,
+  commentCount,
+  readonly,
+  contentHidden,
+  onEdit,
+  onCommentsOpen,
+  onCommentCreate,
+  onShareImageOpen,
+}: {
+  memo: Memo;
+  parentMemo?: Memo;
+  parentStatus?: MemoParentStatus;
+  onParentRetry?: () => void;
+  from: string;
+  commentCount?: number;
+  readonly: boolean;
+  contentHidden: boolean;
+  onEdit: () => void;
+  onCommentsOpen: () => void;
+  onCommentCreate: () => void;
+  onShareImageOpen: () => void;
+}) => {
+  const { setMemoDetail } = useAppSidebar();
+
+  useEffect(() => {
+    setMemoDetail({
+      memo,
+      parentMemo,
+      parentStatus,
+      onParentRetry,
+      from,
+      commentCount,
+      readonly,
+      contentHidden,
+      onEdit,
+      onCommentsOpen,
+      onCommentCreate,
+      onShareImageOpen,
+    });
+  }, [
+    commentCount,
+    contentHidden,
+    from,
+    memo,
+    onCommentCreate,
+    onCommentsOpen,
+    onEdit,
+    onShareImageOpen,
+    parentMemo,
+    parentStatus,
+    onParentRetry,
+    readonly,
+    setMemoDetail,
+  ]);
+
+  useEffect(() => () => setMemoDetail(undefined), [setMemoDetail]);
+
+  return null;
+};
+
+const MemoDetail = () => {
   const t = useTranslate();
-  const { md } = useResponsiveWidth();
+  const { currentUser, isInitialized: authInitialized, userTagsSetting } = useAuth();
+  const { isInitialized: instanceInitialized } = useInstance();
+  const [shareImageDialogOpen, setShareImageDialogOpen] = useState(false);
   const params = useParams();
-  const navigateTo = useNavigateTo();
-  const { state: locationState } = useLocation();
-  const currentUser = useCurrentUser();
-  const uid = params.uid;
-  const memoName = `${memoNamePrefix}${uid}`;
-  const memo = memoStore.getMemoByName(memoName);
-  const [parentMemo, setParentMemo] = useState<Memo | undefined>(undefined);
-  const [showCommentEditor, setShowCommentEditor] = useState(false);
-  const commentRelations =
-    memo?.relations.filter((relation) => relation.relatedMemo?.name === memo.name && relation.type === MemoRelation_Type.COMMENT) || [];
-  const comments = commentRelations.map((relation) => memoStore.getMemoByName(relation.memo!.name)).filter((memo) => memo) as any as Memo[];
-  const showCreateCommentButton = currentUser && !showCommentEditor;
+  const location = useLocation();
+  const { state: locationState, hash } = location;
+  const memoViewRef = useRef<MemoViewHandle>(null);
+  const commentSectionRef = useRef<MemoCommentSectionHandle>(null);
+  const handleShareImageOpen = useCallback(() => setShareImageDialogOpen(true), []);
+  const handleEdit = useCallback(() => memoViewRef.current?.openEditor(), []);
 
-  // Prepare memo.
-  useEffect(() => {
-    if (memoName) {
-      memoStore.getOrFetchMemoByName(memoName).catch((error: ClientError) => {
-        toast.error(error.details);
-        navigateTo("/403");
-      });
-    } else {
-      navigateTo("/404");
-    }
-  }, [memoName]);
+  // Detect share mode from the route parameter.
+  const shareToken = params.token;
+  const isShareMode = !!shareToken;
 
-  // Prepare memo comments.
+  // Primary memo fetch — share token or direct name.
+  const memoNameFromParams = params.uid ? `${memoNamePrefix}${params.uid}` : "";
+  const {
+    data: memoFromDirect,
+    error: directError,
+    isLoading: directLoading,
+    isUnavailable: directUnavailable,
+    fetchStatus: directFetchStatus,
+  } = useMemo(memoNameFromParams, { enabled: !isShareMode && !!memoNameFromParams });
+  const { data: memoFromShare, error: shareError, isLoading: shareLoading } = useSharedMemo(shareToken ?? "", { enabled: isShareMode });
+
+  const memo = isShareMode ? memoFromShare : memoFromDirect;
+  const error = isShareMode ? shareError : directError;
+  const isLoading = isShareMode ? shareLoading : directLoading;
+  const hasExplicitOrigin =
+    !!locationState && typeof locationState === "object" && typeof (locationState as { from?: unknown }).from === "string";
+  const resolvedOrigin = resolveMemoDetailOrigin(locationState, { memoArchived: memo?.state === State.ARCHIVED });
+  const parentPage = !hasExplicitOrigin && !currentUser && memo?.state !== State.ARCHIVED ? ROUTES.EXPLORE : resolvedOrigin;
+  const memoName = memo?.name ?? memoNameFromParams;
+  // Keyed by memo so another memo never renders revealed; cleared on leave so returning blurs again.
+  const [blurRevealedMemoName, setBlurRevealedMemoName] = useState<string>();
+  const showBlurredContent = blurRevealedMemoName === memoName;
+  const handleShowBlurredContentChange = useCallback((show: boolean) => setBlurRevealedMemoName(show ? memoName : undefined), [memoName]);
+  useEffect(() => setBlurRevealedMemoName(undefined), [memoName]);
+  const displayMemo = useReactMemo(() => {
+    if (!memo) return undefined;
+    if (!isShareMode) return memo;
+    return { ...memo, attachments: withShareAttachmentLinks(memo.attachments as Attachment[], shareToken!) };
+  }, [isShareMode, memo, shareToken]);
+
+  useMemoDetailError({
+    error: error as Error | null,
+  });
+
+  const {
+    data: fetchedParent,
+    error: parentError,
+    isUnavailable: parentUnavailable,
+    refetch: refetchParent,
+  } = useMemo(memo?.parent || "", {
+    enabled: !isShareMode && !!memo?.parent,
+  });
+
+  // Private parents return 401 to guests. The transport still owns session
+  // recovery; only a settled guest view treats that result as unavailable.
+  const guestParentDenied =
+    authInitialized && !currentUser && parentError instanceof ConnectError && parentError.code === Code.Unauthenticated;
+  const parentStatus: MemoParentStatus | undefined =
+    !isShareMode && memo?.parent
+      ? parentUnavailable || guestParentDenied
+        ? "unavailable"
+        : parentError
+          ? "error"
+          : !fetchedParent
+            ? "loading"
+            : undefined
+      : undefined;
+  const parentMemo = parentStatus ? undefined : fetchedParent;
+  const handleParentRetry = useCallback(() => {
+    void refetchParent();
+  }, [refetchParent]);
+
+  const {
+    data: comments = [],
+    fetchNextPage: fetchNextComments,
+    hasNextPage: hasNextComments,
+    isFetchingNextPage: isFetchingNextComments,
+  } = useInfiniteMemoComments(memoName, {
+    enabled: !isShareMode && !!memo,
+  });
+  const commentCount = memo ? Math.max(memo.commentCount, comments.length) : 0;
+
+  const handleCommentsOpen = useCallback(() => {
+    commentSectionRef.current?.scrollIntoView();
+    window.history.replaceState(window.history.state, "", `${location.pathname}${location.search}#${MEMO_COMMENTS_ANCHOR_ID}`);
+  }, [location.pathname, location.search]);
+
+  const handleCommentCreate = useCallback(() => {
+    handleCommentsOpen();
+    void commentSectionRef.current?.openEditor();
+  }, [handleCommentsOpen]);
+
+  // Scroll to the hash target once it's in the DOM. The effect re-runs as the memo loads (footnote
+  // anchors) and as comments arrive (comment anchors), since the target may render in either; the
+  // ref guards against re-scrolling the same hash on every later comments page-load.
+  const scrolledHashRef = useRef("");
   useEffect(() => {
-    if (!memo) {
+    if (!hash) return;
+    const scrollKey = `${memoName}\0${hash}`;
+    if (scrolledHashRef.current === scrollKey) return;
+    const fragment = decodeURIComponent(hash.slice(1));
+    const commentSection = commentSectionRef.current;
+    if (commentSection && (fragment === MEMO_COMMENTS_ANCHOR_ID || fragment === LEGACY_MEMO_COMMENTS_ANCHOR_ID)) {
+      scrolledHashRef.current = scrollKey;
+      commentSection.scrollIntoView();
       return;
     }
 
-    (async () => {
-      if (memo.parent) {
-        memoStore.getOrFetchMemoByName(memo.parent).then((memo: Memo) => {
-          setParentMemo(memo);
-        });
-      } else {
-        setParentMemo(undefined);
-      }
-      await Promise.all(commentRelations.map((relation) => memoStore.getOrFetchMemoByName(relation.memo!.name)));
-    })();
-  }, [memo]);
+    // A legacy #comments link on a share-token page has no comment section. Let it
+    // resolve to a historical body heading instead of turning into a dead fragment.
+    const el = findMemoAnchorTarget(document, memoName, fragment);
+    if (!el) return;
+    scrolledHashRef.current = scrollKey;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [hash, memo, memoName, comments]);
 
-  if (!memo) {
-    return null;
+  // Keep the query mounted while revalidating a cached denial. Redirecting
+  // earlier would abort the request that could confirm restored access.
+  if (!isShareMode && directUnavailable && directFetchStatus === "idle" && !directError) return <Navigate to="/404" replace />;
+
+  if (isShareMode) {
+    const isNotFound = error instanceof ConnectError && (error.code === Code.NotFound || error.code === Code.Unauthenticated);
+    if (isNotFound || (!isLoading && !memo)) {
+      return <Navigate to="/404" replace />;
+    }
   }
 
-  const handleShowCommentEditor = () => {
-    setShowCommentEditor(true);
-  };
-
-  const handleCommentCreated = async (memoCommentName: string) => {
-    await memoStore.getOrFetchMemoByName(memoCommentName);
-    await memoStore.getOrFetchMemoByName(memo.name, { skipCache: true });
-    setShowCommentEditor(false);
-  };
-
+  // Start the permitted requests as soon as routing is unlocked, but do not
+  // expose content before tag-blur and instance display settings settle.
+  if (isLoading || !memo || !displayMemo || !authInitialized || !instanceInitialized) {
+    return null;
+  }
+  const contentHidden = isMemoBlurred(displayMemo, userTagsSetting) && !showBlurredContent;
+  const parentBlurred = !!parentMemo && isMemoBlurred(parentMemo, userTagsSetting);
+  const mentionResolutionContents = [displayMemo.content, ...comments.map((comment) => comment.content)];
+  const userResolutionNames = Array.from(
+    new Set([displayMemo, ...comments].flatMap((item) => [item.creator, ...(item.reactions ?? []).map((reaction) => reaction.creator)])),
+  );
   return (
-    <section className="@container w-full max-w-5xl min-h-full flex flex-col justify-start items-center sm:pt-3 md:pt-6 pb-8">
-      {!md && (
-        <MobileHeader>
-          <MemoDetailSidebarDrawer memo={memo} parentPage={locationState?.from} />
-        </MobileHeader>
-      )}
-      <div className={cn("w-full flex flex-row justify-start items-start px-4 sm:px-6 gap-4")}>
-        <div className={cn(md ? "w-[calc(100%-15rem)]" : "w-full")}>
-          {parentMemo && (
-            <div className="w-auto inline-block mb-2">
-              <Link
-                className="px-3 py-1 border border-border rounded-lg max-w-xs w-auto text-sm flex flex-row justify-start items-center flex-nowrap text-muted-foreground hover:shadow hover:opacity-80"
-                to={`/${parentMemo.name}`}
-                state={locationState}
-                viewTransition
-              >
-                <ArrowUpLeftFromCircleIcon className="w-4 h-auto shrink-0 opacity-60 mr-2" />
-                <span className="truncate">{parentMemo.content}</span>
-              </Link>
-            </div>
-          )}
-          <MemoView
-            key={`${memo.name}-${memo.displayTime}`}
-            className="shadow hover:shadow-md transition-all"
-            memo={memo}
-            compact={false}
-            parentPage={locationState?.from}
-            showCreator
-            showVisibility
-            showPinned
-            showNsfwContent
-          />
-          <div className="pt-8 pb-16 w-full">
-            <h2 id="comments" className="sr-only">
-              {t("memo.comment.self")}
-            </h2>
-            <div className="relative mx-auto grow w-full min-h-full flex flex-col justify-start items-start gap-y-1">
-              {comments.length === 0 ? (
-                showCreateCommentButton && (
-                  <div className="w-full flex flex-row justify-center items-center py-6">
-                    <Button variant="ghost" onClick={handleShowCommentEditor}>
-                      <span className="text-muted-foreground">{t("memo.comment.write-a-comment")}</span>
-                      <MessageCircleIcon className="ml-2 w-5 h-auto text-muted-foreground" />
-                    </Button>
-                  </div>
-                )
-              ) : (
-                <>
-                  <div className="w-full flex flex-row justify-between items-center h-8 pl-3 mb-2">
-                    <div className="flex flex-row justify-start items-center">
-                      <MessageCircleIcon className="w-5 h-auto text-muted-foreground mr-1" />
-                      <span className="text-muted-foreground text-sm">{t("memo.comment.self")}</span>
-                      <span className="text-muted-foreground text-sm ml-1">({comments.length})</span>
-                    </div>
-                    {showCreateCommentButton && (
-                      <Button variant="ghost" className="text-muted-foreground" onClick={handleShowCommentEditor}>
-                        {t("memo.comment.write-a-comment")}
-                      </Button>
-                    )}
-                  </div>
-                  {comments.map((comment) => (
-                    <MemoView
-                      key={`${comment.name}-${comment.displayTime}`}
-                      memo={comment}
-                      parentPage={locationState?.from}
-                      showCreator
-                      compact
-                    />
-                  ))}
-                </>
-              )}
-            </div>
-            {showCommentEditor && (
-              <div className="w-full">
-                <MemoEditor
-                  cacheKey={`${memo.name}-${memo.updateTime}-comment`}
-                  placeholder={t("editor.add-your-comment-here")}
-                  parentMemoName={memo.name}
-                  autoFocus
-                  onConfirm={handleCommentCreated}
-                  onCancel={() => setShowCommentEditor(false)}
-                />
-              </div>
-            )}
-          </div>
-        </div>
-        {md && (
-          <div className="sticky top-0 left-0 shrink-0 -mt-6 w-56 h-full">
-            <MemoDetailSidebar className="py-6" memo={memo} parentPage={locationState?.from} />
+    <div className="mx-auto w-full max-w-2xl">
+      <MentionResolutionProvider contents={mentionResolutionContents} userNames={userResolutionNames}>
+        <MemoSidebarRegistration
+          memo={displayMemo}
+          parentMemo={parentMemo}
+          parentStatus={parentStatus}
+          onParentRetry={handleParentRetry}
+          from={parentPage}
+          commentCount={isShareMode ? undefined : commentCount}
+          readonly={isShareMode}
+          contentHidden={contentHidden}
+          onEdit={handleEdit}
+          onCommentsOpen={handleCommentsOpen}
+          onCommentCreate={handleCommentCreate}
+          onShareImageOpen={handleShareImageOpen}
+        />
+        {!isShareMode && parentStatus && (
+          <div className="mb-2 md:hidden">
+            <MemoParentPlaceholder status={parentStatus} onRetry={handleParentRetry} />
           </div>
         )}
-      </div>
-    </section>
+        {!isShareMode && parentMemo && (
+          <div className="w-auto inline-block mb-2 md:hidden">
+            <Link
+              className="px-3 py-1 border border-mu-line rounded-mu-lg max-w-xs w-auto mu-body flex flex-row justify-start items-center flex-nowrap text-mu-text-secondary hover:shadow hover:opacity-80"
+              to={`/${parentMemo.name}`}
+              state={createMemoNavigationState(parentPage)}
+              viewTransition
+            >
+              <ArrowUpLeftFromCircleIcon className="mu-icon shrink-0 opacity-60 mr-2" />
+              <span className="truncate">{parentBlurred ? t("memo.parent-memo") : parentMemo.content}</span>
+            </Link>
+          </div>
+        )}
+        <MemoView
+          ref={memoViewRef}
+          key={displayMemo.name}
+          memo={displayMemo}
+          compact={false}
+          parentPage={parentPage}
+          shareImageDialogOpen={shareImageDialogOpen}
+          showBlurredContent={showBlurredContent}
+          onShowBlurredContentChange={handleShowBlurredContentChange}
+          showCreator
+          showVisibility
+          showPinned
+          showSpace
+          onShareImageDialogOpenChange={setShareImageDialogOpen}
+        />
+        {!isShareMode && (
+          <MemoCommentSection
+            ref={commentSectionRef}
+            memo={displayMemo}
+            comments={comments}
+            commentCount={commentCount}
+            parentPage={parentPage}
+            hasMoreComments={hasNextComments}
+            isFetchingMoreComments={isFetchingNextComments}
+            onLoadMoreComments={fetchNextComments}
+          />
+        )}
+      </MentionResolutionProvider>
+    </div>
   );
-});
+};
 
 export default MemoDetail;

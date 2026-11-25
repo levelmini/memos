@@ -6,8 +6,8 @@ import (
 
 	"github.com/pkg/errors"
 
-	// Import the SQLite driver.
-	_ "modernc.org/sqlite"
+	// Note: modernc.org/sqlite driver is imported in functions.go where
+	// RegisterScalarFunction is used. No blank import needed here.
 
 	"github.com/usememos/memos/internal/profile"
 	"github.com/usememos/memos/store"
@@ -27,12 +27,29 @@ func NewDB(profile *profile.Profile) (store.Driver, error) {
 		return nil, errors.New("dsn required")
 	}
 
+	if err := ensureUnicodeLowerRegistered(); err != nil {
+		return nil, errors.Wrap(err, "failed to register sqlite unicode lower function")
+	}
+
+	if err := ensureRegexpRegistered(); err != nil {
+		return nil, errors.Wrap(err, "failed to register sqlite regexp function")
+	}
+
 	// Connect to the database with some sane settings:
 	// - No shared-cache: it's obsolete; WAL journal mode is a better solution.
 	// - No foreign key constraints: it's currently disabled by default, but it's a
 	// good practice to be explicit and prevent future surprises on SQLite upgrades.
 	// - Journal mode set to WAL: it's the recommended journal mode for most applications
 	// as it prevents locking issues.
+	// - mmap size set to 0: it disables memory mapping, which can cause OOM errors on some systems.
+	// - Transactions begin IMMEDIATE: several drivers' transactions read before they
+	//   write (a membership or lifecycle check, then an insert). With the default
+	//   DEFERRED mode such a transaction holds a read snapshot when it tries to
+	//   write, and if any other connection committed in between (for example the
+	//   asynchronous personal-access-token last-used update that runs on every
+	//   token-authenticated request) SQLite refuses the upgrade with SQLITE_BUSY
+	//   at once, without consulting busy_timeout. Taking the write lock up front
+	//   makes those transactions queue behind the busy handler instead.
 	//
 	// Notes:
 	// - When using the `modernc.org/sqlite` driver, each pragma must be prefixed with `_pragma=`.
@@ -41,7 +58,7 @@ func NewDB(profile *profile.Profile) (store.Driver, error) {
 	// - https://pkg.go.dev/modernc.org/sqlite#Driver.Open
 	// - https://www.sqlite.org/sharedcache.html
 	// - https://www.sqlite.org/pragma.html
-	sqliteDB, err := sql.Open("sqlite", profile.DSN+"?_pragma=foreign_keys(0)&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
+	sqliteDB, err := sql.Open("sqlite", profile.DSN+"?_pragma=foreign_keys(0)&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=mmap_size(0)&_txlock=immediate")
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open db with dsn: %s", profile.DSN)
 	}
@@ -67,4 +84,16 @@ func (d *DB) IsInitialized(ctx context.Context) (bool, error) {
 		return false, errors.Wrap(err, "failed to check if database is initialized")
 	}
 	return exists, nil
+}
+
+// GetDatabaseSize returns the database size in bytes, or -1 if unavailable.
+func (d *DB) GetDatabaseSize(ctx context.Context) (int64, error) {
+	var pageCount, pageSize int64
+	if err := d.db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return -1, errors.Wrap(err, "failed to read page_count")
+	}
+	if err := d.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return -1, errors.Wrap(err, "failed to read page_size")
+	}
+	return pageCount * pageSize, nil
 }

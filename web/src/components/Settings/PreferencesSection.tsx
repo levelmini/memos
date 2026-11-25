@@ -1,81 +1,198 @@
-import { observer } from "mobx-react-lite";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
-import { userStore } from "@/store";
-import { Visibility } from "@/types/proto/api/v1/memo_service";
-import { UserSetting_GeneralSetting } from "@/types/proto/api/v1/user_service";
-import { useTranslate } from "@/utils/i18n";
-import { convertVisibilityFromString, convertVisibilityToString } from "@/utils/memo";
+import { create } from "@bufbuild/protobuf";
+import { Select, Switch } from "@usememos/ui";
+import { useMemo } from "react";
+import { useAuth } from "@/contexts/AuthContext";
+import { updateDevicePreferences, useDevicePreferences } from "@/hooks/useDevicePreferences";
+import { useUpdateUserGeneralSetting } from "@/hooks/useUserQueries";
+import { UserSetting_GeneralSetting, UserSetting_GeneralSettingSchema } from "@/types/proto/api/user_service_pb";
+import { loadLocale, useTranslate } from "@/utils/i18n";
+import { convertVisibilityFromString, DEFAULT_VISIBILITY_OPTIONS } from "@/utils/memo";
+import { loadTheme } from "@/utils/theme";
 import LocaleSelect from "../LocaleSelect";
 import ThemeSelect from "../ThemeSelect";
 import VisibilityIcon from "../VisibilityIcon";
-import WebhookSection from "./WebhookSection";
+import SettingGroup from "./SettingGroup";
+import { SettingList, SettingListItem } from "./SettingList";
+import SettingSection from "./SettingSection";
 
-const PreferencesSection = observer(() => {
+const PreferencesSection = () => {
   const t = useTranslate();
-  const generalSetting = userStore.state.userGeneralSetting;
+  const { currentUser, userGeneralSetting: generalSetting, refetchSettings } = useAuth();
+  const { mutate: updateUserGeneralSetting, isPending: isUpdatingGeneralSetting } = useUpdateUserGeneralSetting(currentUser?.name);
+  const devicePreferences = useDevicePreferences();
 
-  const handleLocaleSelectChange = async (locale: Locale) => {
-    await userStore.updateUserGeneralSetting({ locale }, ["locale"]);
+  const handleLocaleSelectChange = (locale: Locale) => {
+    // Apply locale immediately for instant UI feedback and persist to localStorage
+    loadLocale(locale);
+    // Persist to user settings
+    updateUserGeneralSetting(
+      { generalSetting: { locale }, updateMask: ["locale"] },
+      {
+        onSuccess: () => {
+          refetchSettings();
+        },
+      },
+    );
   };
 
-  const handleDefaultMemoVisibilityChanged = async (value: string) => {
-    await userStore.updateUserGeneralSetting({ memoVisibility: value }, ["memoVisibility"]);
+  const visibilityOptions = useMemo(
+    () => DEFAULT_VISIBILITY_OPTIONS.map((option) => ({ value: option.name, label: t(option.labelKey) })),
+    [t],
+  );
+
+  const handleDefaultMemoVisibilityChanged = (value: string) => {
+    updateUserGeneralSetting(
+      { generalSetting: { memoVisibility: value }, updateMask: ["memo_visibility"] },
+      {
+        onSuccess: () => {
+          refetchSettings();
+        },
+      },
+    );
   };
 
-  const handleThemeChange = async (theme: string) => {
-    await userStore.updateUserGeneralSetting({ theme }, ["theme"]);
+  const handleThemeChange = (theme: string) => {
+    // Apply theme immediately for instant UI feedback
+    loadTheme(theme);
+    // Persist to user settings
+    updateUserGeneralSetting(
+      { generalSetting: { theme }, updateMask: ["theme"] },
+      {
+        onSuccess: () => {
+          refetchSettings();
+        },
+      },
+    );
+  };
+
+  const handleSaveMediaMetadataChange = (saveMediaMetadata: boolean) => {
+    updateUserGeneralSetting(
+      { generalSetting: { saveMediaMetadata }, updateMask: ["save_media_metadata"] },
+      {
+        onSuccess: async () => {
+          await refetchSettings();
+        },
+      },
+    );
   };
 
   // Provide default values if setting is not loaded yet
-  const setting: UserSetting_GeneralSetting = generalSetting || {
-    locale: "en",
-    memoVisibility: "PRIVATE",
-    theme: "default",
-  };
+  const setting: UserSetting_GeneralSetting =
+    generalSetting ||
+    create(UserSetting_GeneralSettingSchema, {
+      locale: "en",
+      memoVisibility: "PRIVATE",
+      theme: "system",
+      saveMediaMetadata: false,
+    });
 
   return (
-    <div className="w-full flex flex-col gap-2 pt-2 pb-4">
-      <p className="font-medium text-muted-foreground">{t("common.basic")}</p>
+    <SettingSection title={t("setting.preference.label")}>
+      <SettingGroup title={t("setting.preference.appearance-title")} description={t("setting.preference.appearance-description")}>
+        <SettingList>
+          <SettingListItem label={t("common.language")} description={t("setting.preference.language-description")}>
+            <LocaleSelect value={setting.locale} onChange={handleLocaleSelectChange} />
+          </SettingListItem>
 
-      <div className="w-full flex flex-row justify-between items-center">
-        <span>{t("common.language")}</span>
-        <LocaleSelect value={setting.locale} onChange={handleLocaleSelectChange} />
-      </div>
+          <SettingListItem label={t("setting.preference.theme")} description={t("setting.preference.theme-description")}>
+            <ThemeSelect value={setting.theme} onValueChange={handleThemeChange} />
+          </SettingListItem>
+        </SettingList>
+      </SettingGroup>
 
-      <div className="w-full flex flex-row justify-between items-center">
-        <span>{t("setting.preference-section.theme")}</span>
-        <ThemeSelect value={setting.theme} onValueChange={handleThemeChange} />
-      </div>
+      <SettingGroup
+        title={t("setting.preference.memo-defaults-title")}
+        description={t("setting.preference.memo-defaults-description")}
+        showSeparator
+      >
+        <SettingList>
+          <SettingListItem
+            label={t("setting.preference.default-memo-visibility")}
+            description={t("setting.preference.default-memo-visibility-description")}
+          >
+            <Select.Root
+              value={setting.memoVisibility || "PRIVATE"}
+              items={visibilityOptions}
+              onValueChange={(value) => value !== null && handleDefaultMemoVisibilityChanged(value)}
+            >
+              <Select.Trigger className="min-w-fit">
+                <div className="flex items-center gap-2">
+                  <VisibilityIcon visibility={convertVisibilityFromString(setting.memoVisibility)} />
+                  <Select.Value />
+                </div>
+              </Select.Trigger>
+              <Select.Popup>
+                {visibilityOptions.map((option) => (
+                  <Select.Item key={option.value} value={option.value} className="whitespace-nowrap">
+                    {option.label}
+                  </Select.Item>
+                ))}
+              </Select.Popup>
+            </Select.Root>
+          </SettingListItem>
+        </SettingList>
+      </SettingGroup>
 
-      <p className="font-medium text-muted-foreground">{t("setting.preference")}</p>
+      <SettingGroup
+        title={t("setting.preference.uploads-privacy-title")}
+        description={t("setting.preference.uploads-privacy-description")}
+        showSeparator
+      >
+        <SettingList>
+          <SettingListItem
+            label={t("setting.preference.save-media-metadata")}
+            description={t("setting.preference.save-media-metadata-description")}
+          >
+            <Switch
+              aria-label={t("setting.preference.save-media-metadata")}
+              checked={setting.saveMediaMetadata}
+              disabled={isUpdatingGeneralSetting}
+              onCheckedChange={handleSaveMediaMetadataChange}
+            />
+          </SettingListItem>
+        </SettingList>
+      </SettingGroup>
 
-      <div className="w-full flex flex-row justify-between items-center">
-        <span className="truncate">{t("setting.preference-section.default-memo-visibility")}</span>
-        <Select value={setting.memoVisibility} onValueChange={handleDefaultMemoVisibilityChanged}>
-          <SelectTrigger className="min-w-fit">
-            <div className="flex items-center gap-2">
-              <VisibilityIcon visibility={convertVisibilityFromString(setting.memoVisibility)} />
-              <SelectValue />
-            </div>
-          </SelectTrigger>
-          <SelectContent>
-            {[Visibility.PRIVATE, Visibility.PROTECTED, Visibility.PUBLIC]
-              .map((v) => convertVisibilityToString(v))
-              .map((item) => (
-                <SelectItem key={item} value={item} className="whitespace-nowrap">
-                  {t(`memo.visibility.${item.toLowerCase() as Lowercase<typeof item>}`)}
-                </SelectItem>
-              ))}
-          </SelectContent>
-        </Select>
-      </div>
+      <SettingGroup title={t("setting.preference.device-title")} description={t("setting.preference.device-description")} showSeparator>
+        <SettingList>
+          <SettingListItem label={t("memo.link-preview")} description={t("setting.preference.link-preview-description")}>
+            <Switch
+              aria-label={t("memo.link-preview")}
+              checked={devicePreferences.linkPreview}
+              onCheckedChange={(linkPreview) => updateDevicePreferences({ linkPreview })}
+            />
+          </SettingListItem>
 
-      <Separator className="my-3" />
+          <SettingListItem
+            label={t("setting.preference.double-click-edit")}
+            description={t("setting.preference.double-click-edit-description")}
+          >
+            <Switch
+              aria-label={t("setting.preference.double-click-edit")}
+              checked={devicePreferences.doubleClickEdit}
+              onCheckedChange={(doubleClickEdit) => updateDevicePreferences({ doubleClickEdit })}
+            />
+          </SettingListItem>
 
-      <WebhookSection />
-    </div>
+          <SettingListItem label={t("memo.compact-mode")} description={t("memo.grid-compact-hint")}>
+            <Switch
+              aria-label={t("memo.compact-mode")}
+              checked={devicePreferences.compactMode}
+              onCheckedChange={(compactMode) => updateDevicePreferences({ compactMode })}
+            />
+          </SettingListItem>
+
+          <SettingListItem label={t("memo.include-comments")} description={t("memo.include-comments-hint")}>
+            <Switch
+              aria-label={t("memo.include-comments")}
+              checked={devicePreferences.includeComments}
+              onCheckedChange={(includeComments) => updateDevicePreferences({ includeComments })}
+            />
+          </SettingListItem>
+        </SettingList>
+      </SettingGroup>
+    </SettingSection>
   );
-});
+};
 
 export default PreferencesSection;

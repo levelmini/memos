@@ -1,20 +1,26 @@
-import { ExternalLinkIcon, TrashIcon } from "lucide-react";
+import { Button, List, Tooltip } from "@usememos/ui";
+import { PencilIcon, PlusIcon, TrashIcon } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
-import { Button } from "@/components/ui/button";
-import { userServiceClient } from "@/grpcweb";
+import ConfirmDialog from "@/components/ConfirmDialog";
+import { userServiceClient } from "@/connect";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import { UserWebhook } from "@/types/proto/api/v1/user_service";
+import { toast } from "@/lib/toast";
+import { UserWebhook } from "@/types/proto/api/user_service_pb";
 import { useTranslate } from "@/utils/i18n";
 import CreateWebhookDialog from "../CreateWebhookDialog";
+import LearnMore from "../LearnMore";
+import { SettingList } from "./SettingList";
+import SettingSection from "./SettingSection";
 
 const WebhookSection = () => {
   const t = useTranslate();
   const currentUser = useCurrentUser();
   const [webhooks, setWebhooks] = useState<UserWebhook[]>([]);
   const [isCreateWebhookDialogOpen, setIsCreateWebhookDialogOpen] = useState(false);
+  const [editingWebhookName, setEditingWebhookName] = useState<string | undefined>(undefined);
+  const [deleteTarget, setDeleteTarget] = useState<UserWebhook | undefined>(undefined);
 
-  const listWebhooks = async () => {
+  const fetchWebhooks = async () => {
     if (!currentUser) return [];
     const { webhooks } = await userServiceClient.listUserWebhooks({
       parent: currentUser.name,
@@ -23,102 +29,120 @@ const WebhookSection = () => {
   };
 
   useEffect(() => {
-    listWebhooks().then((webhooks) => {
-      setWebhooks(webhooks);
-    });
+    fetchWebhooks().then(setWebhooks);
   }, [currentUser]);
 
   const handleCreateWebhookDialogConfirm = async () => {
-    const webhooks = await listWebhooks();
+    const webhooks = await fetchWebhooks();
+    const name = webhooks[webhooks.length - 1]?.displayName || "";
     setWebhooks(webhooks);
     setIsCreateWebhookDialogOpen(false);
+    toast.add({ title: t("setting.webhook.create-dialog.create-webhook-success", { name }), type: "success" });
   };
 
-  const handleDeleteWebhook = async (webhook: UserWebhook) => {
-    const confirmed = window.confirm(`Are you sure to delete webhook \`${webhook.displayName}\`? You cannot undo this action.`);
-    if (confirmed) {
-      await userServiceClient.deleteUserWebhook({ name: webhook.name });
-      setWebhooks(webhooks.filter((item) => item.name !== webhook.name));
-    }
+  const handleEditWebhook = (webhook: UserWebhook) => {
+    setEditingWebhookName(webhook.name);
+  };
+
+  const handleEditWebhookDialogConfirm = async () => {
+    const webhooks = await fetchWebhooks();
+    setWebhooks(webhooks);
+    setEditingWebhookName(undefined);
+  };
+
+  const handleDeleteWebhook = (webhook: UserWebhook) => {
+    setDeleteTarget(webhook);
+  };
+
+  const confirmDeleteWebhook = async () => {
+    if (!deleteTarget) return;
+    await userServiceClient.deleteUserWebhook({ name: deleteTarget.name });
+    setWebhooks((prev) => prev.filter((item) => item.name !== deleteTarget.name));
+    const name = deleteTarget.displayName;
+    setDeleteTarget(undefined);
+    toast.add({ title: t("setting.webhook.delete-dialog.delete-webhook-success", { name }), type: "success" });
   };
 
   return (
-    <div className="w-full flex flex-col justify-start items-start">
-      <div className="w-full flex justify-between items-center">
-        <div className="flex-auto space-y-1">
-          <p className="flex flex-row justify-start items-center font-medium text-muted-foreground">{t("setting.webhook-section.title")}</p>
+    <SettingSection
+      title={
+        <div className="flex items-center gap-2">
+          <span>{t("setting.webhook.title")}</span>
+          <LearnMore url="https://usememos.com/docs/integrations/webhooks" />
         </div>
-        <div>
-          <Button color="primary" onClick={() => setIsCreateWebhookDialogOpen(true)}>
-            {t("common.create")}
-          </Button>
-        </div>
-      </div>
-      <div className="w-full mt-2 flow-root">
-        <div className="overflow-x-auto">
-          <div className="inline-block min-w-full border border-border rounded-lg align-middle">
-            <table className="min-w-full divide-y divide-border">
-              <thead>
-                <tr>
-                  <th scope="col" className="px-3 py-2 text-left text-sm font-semibold text-foreground">
-                    {t("common.name")}
-                  </th>
-                  <th scope="col" className="px-3 py-2 text-left text-sm font-semibold text-foreground">
-                    {t("setting.webhook-section.url")}
-                  </th>
-                  <th scope="col" className="relative px-3 py-2 pr-4">
-                    <span className="sr-only">{t("common.delete")}</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {webhooks.map((webhook) => (
-                  <tr key={webhook.name}>
-                    <td className="whitespace-nowrap px-3 py-2 text-sm text-foreground">{webhook.displayName}</td>
-                    <td className="max-w-[200px] px-3 py-2 text-sm text-foreground truncate" title={webhook.url}>
-                      {webhook.url}
-                    </td>
-                    <td className="relative whitespace-nowrap px-3 py-2 text-right text-sm">
+      }
+      actions={
+        <Button variant="primary" onClick={() => setIsCreateWebhookDialogOpen(true)} icon={<PlusIcon />}>
+          {t("common.create")}
+        </Button>
+      }
+    >
+      {webhooks.length === 0 ? (
+        <p className="py-6 text-center mu-body text-mu-text-secondary">{t("setting.webhook.no-webhooks-found")}</p>
+      ) : (
+        <SettingList aria-label={t("setting.webhook.title")}>
+          {webhooks.map((webhook) => (
+            <List.Item key={webhook.name} className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="mu-label break-words">{webhook.displayName}</p>
+                <p className="mt-1 break-all mu-caption text-mu-text-secondary">{webhook.url}</p>
+              </div>
+              <div className="flex shrink-0 items-center gap-1">
+                <Tooltip.Root>
+                  <Tooltip.Trigger
+                    render={
                       <Button
                         variant="ghost"
-                        onClick={() => {
-                          handleDeleteWebhook(webhook);
-                        }}
-                      >
-                        <TrashIcon className="text-destructive w-4 h-auto" />
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
+                        onClick={() => handleEditWebhook(webhook)}
+                        aria-label={`${t("common.edit")}: ${webhook.displayName}`}
+                        icon={<PencilIcon />}
+                      />
+                    }
+                  />
+                  <Tooltip.Popup>{t("common.edit")}</Tooltip.Popup>
+                </Tooltip.Root>
+                <Tooltip.Root>
+                  <Tooltip.Trigger
+                    render={
+                      <Button
+                        variant="ghost"
+                        onClick={() => handleDeleteWebhook(webhook)}
+                        aria-label={`${t("common.delete")}: ${webhook.displayName}`}
+                        icon={<TrashIcon />}
+                      />
+                    }
+                  />
+                  <Tooltip.Popup>{t("common.delete")}</Tooltip.Popup>
+                </Tooltip.Root>
+              </div>
+            </List.Item>
+          ))}
+        </SettingList>
+      )}
 
-                {webhooks.length === 0 && (
-                  <tr>
-                    <td className="whitespace-nowrap px-3 py-2 text-sm text-foreground" colSpan={3}>
-                      {t("setting.webhook-section.no-webhooks-found")}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-      <div className="w-full mt-2">
-        <Link
-          className="text-muted-foreground text-sm inline-flex flex-row justify-start items-center hover:underline hover:text-primary"
-          to="https://www.usememos.com/docs/integrations/webhooks"
-          target="_blank"
-        >
-          {t("common.learn-more")}
-          <ExternalLinkIcon className="inline w-4 h-auto ml-1" />
-        </Link>
-      </div>
       <CreateWebhookDialog
         open={isCreateWebhookDialogOpen}
         onOpenChange={setIsCreateWebhookDialogOpen}
         onSuccess={handleCreateWebhookDialogConfirm}
       />
-    </div>
+      <CreateWebhookDialog
+        key={editingWebhookName ?? "edit-webhook-dialog"}
+        open={!!editingWebhookName}
+        onOpenChange={(open) => !open && setEditingWebhookName(undefined)}
+        webhookName={editingWebhookName}
+        onSuccess={handleEditWebhookDialogConfirm}
+      />
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => !open && setDeleteTarget(undefined)}
+        title={t("setting.webhook.delete-dialog.delete-webhook-title", { name: deleteTarget?.displayName || "" })}
+        description={t("setting.webhook.delete-dialog.delete-webhook-description")}
+        confirmLabel={t("common.delete")}
+        cancelLabel={t("common.cancel")}
+        onConfirm={confirmDeleteWebhook}
+        confirmVariant="danger"
+      />
+    </SettingSection>
   );
 };
 

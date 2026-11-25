@@ -7,16 +7,40 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/usememos/memos/internal/version"
 	storepb "github.com/usememos/memos/proto/gen/store"
 )
+
+// Migration System Overview:
+//
+// The migration system handles database schema versioning and upgrades.
+// Schema version is stored in system_setting.
+//
+// Migration Flow:
+// 1. preMigrate: Check if DB is initialized. If not, apply LATEST.sql
+// 2. checkMinimumUpgradeVersion: Verify the database meets the fixed v0.31.0 baseline
+// 3. Migrate: Apply incremental migrations from current to target version
+// 4. Seed (demo mode, called by the server after the configuration apply): load the demo content
+//
+// Version Tracking:
+// - New installations: Schema version set in system_setting immediately
+// - Existing installations: Must have schema 0.31.8 or newer
+// - Older installations: Must upgrade through v0.31.0 before running this binary
+//
+// Migration Files:
+// - Location: store/migration/{driver}/{version}/NN__description.sql
+// - Naming: NN is a zero-based migration sequence, description is human-readable
+// - Ordering: Calendar year, month, and migration sequence are compared numerically
+// - Every driver ships the same set of migration versions; a schema change is
+//   one file per driver under the same YY.MM/NN
+// - LATEST.sql: Full schema for new installations (faster than incremental migrations)
 
 //go:embed migration
 var migrationFS embed.FS
@@ -25,86 +49,180 @@ var migrationFS embed.FS
 var seedFS embed.FS
 
 const (
-	// MigrateFileNameSplit is the split character between the patch version and the description in the migration file name.
-	// For example, "1__create_table.sql".
+	// MigrateFileNameSplit separates the migration sequence from the description in the migration file name.
+	// For example, "00__create_table.sql".
 	MigrateFileNameSplit = "__"
 	// LatestSchemaFileName is the name of the latest schema file.
-	// This file is used to apply the latest schema when no migration history is found.
+	// This file is used to initialize fresh installations with the current schema.
 	LatestSchemaFileName = "LATEST.sql"
+
+	// defaultSchemaVersion is used when schema version is empty or not set.
+	// This handles edge cases for old installations without version tracking.
+	defaultSchemaVersion = "0.0.0"
+
+	// baselineSchemaVersion is the schema shipped by v0.31.0. Historical migrations
+	// were removed at this boundary; this minimum must not advance with releases.
+	baselineSchemaVersion = "0.31.8"
 )
+
+// migrationFile is one embedded migration script with its schema version parsed once.
+type migrationFile struct {
+	path    string
+	version string
+	parsed  [3]int
+}
+
+// isVersionEmpty identifies legacy databases without schema tracking.
+func isVersionEmpty(schemaVersion string) bool {
+	return schemaVersion == "" || schemaVersion == defaultSchemaVersion
+}
+
+// shouldApplyMigration reports whether a file version lies after the current
+// database version and at or before the target version.
+func shouldApplyMigration(fileVersion, currentDBVersion, targetVersion [3]int) bool {
+	return compareParsedSchemaVersions(fileVersion, currentDBVersion) > 0 &&
+		compareParsedSchemaVersions(fileVersion, targetVersion) <= 0
+}
+
+// validateMigrationFileName checks if a migration file follows the expected naming convention.
+// Expected format: "NN__description.sql" where NN is a zero-padded number.
+func validateMigrationFileName(filename string) error {
+	if !migrationFilePattern.MatchString(filename) {
+		return errors.Errorf("invalid migration filename %q; expected NN__description.sql", filename)
+	}
+	return nil
+}
 
 // Migrate migrates the database schema to the latest version.
 // It checks the current schema version and applies any necessary migrations.
-// It also seeds the database with initial data if in demo mode.
 func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.preMigrate(ctx); err != nil {
 		return errors.Wrap(err, "failed to pre-migrate")
 	}
 
-	switch s.profile.Mode {
-	case "prod":
-		workspaceBasicSetting, err := s.GetWorkspaceBasicSetting(ctx)
-		if err != nil {
-			return errors.Wrap(err, "failed to get workspace basic setting")
-		}
-		currentSchemaVersion, err := s.GetCurrentSchemaVersion()
-		if err != nil {
-			return errors.Wrap(err, "failed to get current schema version")
-		}
-		if version.IsVersionGreaterThan(workspaceBasicSetting.SchemaVersion, currentSchemaVersion) {
-			slog.Error("cannot downgrade schema version",
-				slog.String("databaseVersion", workspaceBasicSetting.SchemaVersion),
-				slog.String("currentVersion", currentSchemaVersion),
-			)
-			return errors.Errorf("cannot downgrade schema version from %s to %s", workspaceBasicSetting.SchemaVersion, currentSchemaVersion)
-		}
-		if version.IsVersionGreaterThan(currentSchemaVersion, workspaceBasicSetting.SchemaVersion) {
-			filePaths, err := fs.Glob(migrationFS, fmt.Sprintf("%s*/*.sql", s.getMigrationBasePath()))
-			if err != nil {
-				return errors.Wrap(err, "failed to read migration files")
-			}
-			sort.Strings(filePaths)
-
-			// Start a transaction to apply the latest schema.
-			tx, err := s.driver.GetDB().Begin()
-			if err != nil {
-				return errors.Wrap(err, "failed to start transaction")
-			}
-			defer tx.Rollback()
-
-			slog.Info("start migration", slog.String("currentSchemaVersion", workspaceBasicSetting.SchemaVersion), slog.String("targetSchemaVersion", currentSchemaVersion))
-			for _, filePath := range filePaths {
-				fileSchemaVersion, err := s.getSchemaVersionOfMigrateScript(filePath)
-				if err != nil {
-					return errors.Wrap(err, "failed to get schema version of migrate script")
-				}
-				if version.IsVersionGreaterThan(fileSchemaVersion, workspaceBasicSetting.SchemaVersion) && version.IsVersionGreaterOrEqualThan(currentSchemaVersion, fileSchemaVersion) {
-					bytes, err := migrationFS.ReadFile(filePath)
-					if err != nil {
-						return errors.Wrapf(err, "failed to read minor version migration file: %s", filePath)
-					}
-					stmt := string(bytes)
-					if err := s.execute(ctx, tx, stmt); err != nil {
-						return errors.Wrapf(err, "migrate error: %s", stmt)
-					}
-				}
-			}
-			if err := tx.Commit(); err != nil {
-				return errors.Wrap(err, "failed to commit transaction")
-			}
-			slog.Info("end migrate")
-			if err := s.updateCurrentSchemaVersion(ctx, currentSchemaVersion); err != nil {
-				return errors.Wrap(err, "failed to update current schema version")
-			}
-		}
-	case "demo":
-		// In demo mode, we should seed the database.
-		if err := s.seed(ctx); err != nil {
-			return errors.Wrap(err, "failed to seed")
-		}
-	default:
-		// For other modes (like dev), no special migration handling needed
+	instanceBasicSetting, err := s.GetInstanceBasicSetting(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to get instance basic setting")
 	}
+	currentSchemaVersion, err := s.GetCurrentSchemaVersion()
+	if err != nil {
+		return errors.Wrap(err, "failed to get current schema version")
+	}
+	order, err := compareSchemaVersions(instanceBasicSetting.SchemaVersion, currentSchemaVersion)
+	if err != nil {
+		return err
+	}
+	if order > 0 {
+		slog.Error("cannot downgrade schema version",
+			slog.String("databaseVersion", instanceBasicSetting.SchemaVersion),
+			slog.String("currentVersion", currentSchemaVersion),
+		)
+		return errors.Errorf("cannot downgrade schema version from %s to %s", instanceBasicSetting.SchemaVersion, currentSchemaVersion)
+	}
+	// Apply migrations if needed.
+	if order < 0 {
+		if err := s.applyMigrations(ctx, instanceBasicSetting.SchemaVersion, currentSchemaVersion); err != nil {
+			return errors.Wrap(err, "failed to apply migrations")
+		}
+	}
+
+	if err := s.initializeInstanceAccessSetting(ctx); err != nil {
+		return errors.Wrap(err, "failed to initialize instance access setting")
+	}
+	return nil
+}
+
+// initializeInstanceAccessSetting captures the pre-ACCESS behavior exactly once.
+// Existing installations that configured an external URL were public; all others
+// were private. Once persisted, later URL changes do not alter the access policy.
+func (s *Store) initializeInstanceAccessSetting(ctx context.Context) error {
+	accessMode := storepb.InstanceAccessMode_INSTANCE_ACCESS_MODE_PRIVATE
+	if strings.TrimSpace(s.profile.InstanceURL) != "" {
+		accessMode = storepb.InstanceAccessMode_INSTANCE_ACCESS_MODE_PUBLIC
+	}
+	value, err := protojson.Marshal(&storepb.InstanceAccessSetting{AccessMode: accessMode})
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal initial instance access setting")
+	}
+	_, err = s.driver.CreateInstanceSettingIfNotExists(ctx, &InstanceSetting{
+		Name:  storepb.InstanceSettingKey_ACCESS.String(),
+		Value: string(value),
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to conditionally create initial instance access setting")
+	}
+	return nil
+}
+
+// applyMigrations applies all necessary migration files between current and target schema versions.
+// It runs all migrations in a single transaction for atomicity.
+func (s *Store) applyMigrations(ctx context.Context, currentSchemaVersion, targetSchemaVersion string) error {
+	current, err := parseSchemaVersion(currentSchemaVersion)
+	if err != nil {
+		return err
+	}
+	target, err := parseSchemaVersion(targetSchemaVersion)
+	if err != nil {
+		return err
+	}
+	files, err := s.listMigrationFiles()
+	if err != nil {
+		return err
+	}
+
+	cachedBasicSetting, err := s.GetInstanceBasicSetting(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to get instance basic setting")
+	}
+	// The cache hands out a shared value; change a copy until the commit.
+	basicSetting := &storepb.InstanceBasicSetting{}
+	proto.Merge(basicSetting, cachedBasicSetting)
+
+	// Start a transaction to apply migrations atomically
+	tx, err := s.driver.GetDB().Begin()
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+	defer tx.Rollback()
+
+	slog.Info("start migration",
+		slog.String("currentSchemaVersion", currentSchemaVersion),
+		slog.String("targetSchemaVersion", targetSchemaVersion))
+
+	migrationsApplied := 0
+	for _, file := range files {
+		if !shouldApplyMigration(file.parsed, current, target) {
+			continue
+		}
+		slog.Info("applying migration",
+			slog.String("file", file.path),
+			slog.String("version", file.version))
+
+		bytes, err := migrationFS.ReadFile(file.path)
+		if err != nil {
+			return errors.Wrapf(err, "failed to read migration file: %s", file.path)
+		}
+
+		stmt := string(bytes)
+		if err := s.execute(ctx, tx, stmt); err != nil {
+			return errors.Wrapf(err, "failed to execute migration %s: %s", file.path, err)
+		}
+		migrationsApplied++
+	}
+
+	// Record the schema version in the same transaction, so on SQLite and
+	// PostgreSQL a crash cannot leave migrated tables behind an old version
+	// that re-runs them. MySQL commits DDL implicitly, so there the version
+	// write is only adjacent to the migration, as it was before.
+	if err := s.writeSchemaVersionTx(ctx, tx, basicSetting, targetSchemaVersion); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "failed to commit migration transaction")
+	}
+	s.cacheInstanceBasicSetting(ctx, basicSetting)
+
+	slog.Info("migration completed", slog.Int("migrationsApplied", migrationsApplied))
 	return nil
 }
 
@@ -127,30 +245,31 @@ func (s *Store) preMigrate(ctx context.Context) error {
 			return errors.Wrap(err, "failed to start transaction")
 		}
 		defer tx.Rollback()
+		slog.Info("initializing new database with latest schema", slog.String("file", filePath))
 		if err := s.execute(ctx, tx, string(bytes)); err != nil {
 			return errors.Errorf("failed to execute SQL file %s, err %s", filePath, err)
 		}
-		if err := tx.Commit(); err != nil {
-			return errors.Wrap(err, "failed to commit transaction")
-		}
 
-		// Upsert current schema version to database.
+		// Record the schema version with the schema, so on SQLite and
+		// PostgreSQL a crash cannot leave an initialized database without
+		// one. MySQL commits DDL implicitly and keeps the earlier behavior.
 		schemaVersion, err := s.GetCurrentSchemaVersion()
 		if err != nil {
 			return errors.Wrap(err, "failed to get current schema version")
 		}
-		if err := s.updateCurrentSchemaVersion(ctx, schemaVersion); err != nil {
-			return errors.Wrap(err, "failed to update current schema version")
+		basicSetting := &storepb.InstanceBasicSetting{}
+		if err := s.writeSchemaVersionTx(ctx, tx, basicSetting, schemaVersion); err != nil {
+			return err
 		}
+		if err := tx.Commit(); err != nil {
+			return errors.Wrap(err, "failed to commit transaction")
+		}
+		s.cacheInstanceBasicSetting(ctx, basicSetting)
+		slog.Info("database initialized successfully", slog.String("schemaVersion", schemaVersion))
 	}
 
-	if s.profile.Mode == "prod" {
-		if err := s.normalizeMigrationHistoryList(ctx); err != nil {
-			return errors.Wrap(err, "failed to normalize migration history list")
-		}
-		if err := s.migrateSchemaVersionToSetting(ctx); err != nil {
-			return errors.Wrap(err, "failed to migrate schema version to setting")
-		}
+	if err := s.checkMinimumUpgradeVersion(ctx); err != nil {
+		return err // Error message is already descriptive, don't wrap it
 	}
 	return nil
 }
@@ -163,13 +282,14 @@ func (s *Store) getSeedBasePath() string {
 	return fmt.Sprintf("seed/%s/", s.profile.Driver)
 }
 
-// seed seeds the database with initial data.
-// It reads all seed files from the embedded filesystem and executes them in order.
-// This is only supported for SQLite databases.
-func (s *Store) seed(ctx context.Context) error {
-	// Only seed for SQLite.
+// Seed loads the demo content: every seed file from the embedded filesystem,
+// in name order, in one transaction. The server calls it in demo mode after
+// the declarative configuration is applied, so content attaches to the users
+// the configuration declares. Only SQLite has seed files.
+func (s *Store) Seed(ctx context.Context) error {
+	// Only seed for SQLite - other databases should use production data
 	if s.profile.Driver != "sqlite" {
-		slog.Warn("seed is only supported for SQLite")
+		slog.Warn("seed is only supported for SQLite, skipping for other databases")
 		return nil
 	}
 
@@ -179,7 +299,7 @@ func (s *Store) seed(ctx context.Context) error {
 	}
 
 	// Sort seed files by name. This is important to ensure that seed files are applied in order.
-	sort.Strings(filenames)
+	slices.Sort(filenames)
 	// Start a transaction to apply the seed files.
 	tx, err := s.driver.GetDB().Begin()
 	if err != nil {
@@ -199,42 +319,114 @@ func (s *Store) seed(ctx context.Context) error {
 	return tx.Commit()
 }
 
-func (s *Store) GetCurrentSchemaVersion() (string, error) {
-	currentVersion := version.GetCurrentVersion(s.profile.Mode)
-	minorVersion := version.GetMinorVersion(currentVersion)
-	filePaths, err := fs.Glob(migrationFS, fmt.Sprintf("%s%s/*.sql", s.getMigrationBasePath(), minorVersion))
+// CheckSchemaCurrent fails unless the database is initialized and at the
+// schema version this binary migrates to. Commands that only read, such as a
+// configuration plan, call it instead of Migrate, which writes.
+func (s *Store) CheckSchemaCurrent(ctx context.Context) error {
+	initialized, err := s.driver.IsInitialized(ctx)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to read migration files")
+		return errors.Wrap(err, "failed to check whether the database is initialized")
 	}
+	if !initialized {
+		return errors.New("the database is not initialized; start Memos once to create it")
+	}
+	basic, err := s.GetInstanceBasicSetting(ctx)
+	if err != nil {
+		return err
+	}
+	current, err := s.GetCurrentSchemaVersion()
+	if err != nil {
+		return errors.Wrap(err, "failed to get current schema version")
+	}
+	if basic.SchemaVersion != current {
+		return errors.Errorf("the database schema is %s but this Memos expects %s; start this version of Memos once to migrate it", basic.SchemaVersion, current)
+	}
+	return nil
+}
 
-	sort.Strings(filePaths)
-	if len(filePaths) == 0 {
-		return fmt.Sprintf("%s.0", minorVersion), nil
+// GetCurrentSchemaVersion returns the latest schema version available for the configured database driver.
+// With no incremental migrations, it returns the fixed v0.31.0 baseline.
+//
+// Only this driver's migration files count. Every driver must ship the same
+// migration versions (TestMigrationVersionsMatchAcrossDrivers enforces this),
+// so a driver never records a version whose SQL it has not executed.
+func (s *Store) GetCurrentSchemaVersion() (string, error) {
+	files, err := s.listMigrationFiles()
+	if err != nil {
+		return "", err
 	}
-	return s.getSchemaVersionOfMigrateScript(filePaths[len(filePaths)-1])
+	if len(files) == 0 {
+		return baselineSchemaVersion, nil
+	}
+	latest := files[len(files)-1]
+	if compareParsedSchemaVersions(latest.parsed, mustParseSchemaVersion(baselineSchemaVersion)) < 0 {
+		return baselineSchemaVersion, nil
+	}
+	return latest.version, nil
+}
+
+// listMigrationFiles returns this driver's migration scripts in application
+// order. Every filename is validated and every version parsed before any SQL
+// runs, sequences are ordered numerically (including months with more than
+// 100 migrations), and two files that resolve to the same version are rejected
+// because their relative order would be undefined.
+func (s *Store) listMigrationFiles() ([]migrationFile, error) {
+	return listMigrationFilesFrom(migrationFS, s.getMigrationBasePath())
+}
+
+func listMigrationFilesFrom(fsys fs.FS, basePath string) ([]migrationFile, error) {
+	paths, err := fs.Glob(fsys, basePath+"*/*.sql")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read migration files")
+	}
+	files := make([]migrationFile, 0, len(paths))
+	seen := make(map[string]string, len(paths))
+	for _, path := range paths {
+		version, err := getSchemaVersionOfMigrateScript(path)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get schema version of migrate script")
+		}
+		if previous, exists := seen[version]; exists {
+			return nil, errors.Errorf("migration files %s and %s both resolve to schema version %s", previous, path, version)
+		}
+		seen[version] = path
+		files = append(files, migrationFile{path: path, version: version, parsed: mustParseSchemaVersion(version)})
+	}
+	slices.SortFunc(files, func(a, b migrationFile) int {
+		return compareParsedSchemaVersions(a.parsed, b.parsed)
+	})
+	return files, nil
 }
 
 // getSchemaVersionOfMigrateScript extracts the schema version from the migration script file path.
-// It returns the schema version in the format "major.minor.patch".
-// If the file is the latest schema file, it returns the current schema version.
-func (s *Store) getSchemaVersionOfMigrateScript(filePath string) (string, error) {
-	// If the file is the latest schema file, return the current schema version.
-	if strings.HasSuffix(filePath, LatestSchemaFileName) {
-		return s.GetCurrentSchemaVersion()
-	}
-
-	normalizedPath := filepath.ToSlash(filePath)
-	elements := strings.Split(normalizedPath, "/")
+// Calendar directory YY.MM and file NN__description.sql produce YY.M.(NN+1).
+func getSchemaVersionOfMigrateScript(filePath string) (string, error) {
+	elements := strings.Split(filePath, "/")
 	if len(elements) < 2 {
 		return "", errors.Errorf("invalid file path: %s", filePath)
 	}
-	minorVersion := elements[len(elements)-2]
-	rawPatchVersion := strings.Split(elements[len(elements)-1], MigrateFileNameSplit)[0]
-	patchVersion, err := strconv.Atoi(rawPatchVersion)
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to convert patch version to int: %s", rawPatchVersion)
+	if err := validateMigrationFileName(elements[len(elements)-1]); err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("%s.%d", minorVersion, patchVersion+1), nil
+	series := elements[len(elements)-2]
+	rawSequence, _, _ := strings.Cut(elements[len(elements)-1], MigrateFileNameSplit)
+	sequence, err := strconv.Atoi(rawSequence)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to convert migration sequence to int: %s", rawSequence)
+	}
+	if !calendarMigrationSeriesPattern.MatchString(series) {
+		return "", errors.Errorf("invalid migration series %q; expected YY.MM", series)
+	}
+	yearMonth := strings.Split(series, ".")
+	month, err := strconv.Atoi(yearMonth[1])
+	if err != nil {
+		return "", errors.Wrap(err, "invalid migration month")
+	}
+	schema := fmt.Sprintf("%s.%d.%d", yearMonth[0], month, sequence+1)
+	if _, err := parseSchemaVersion(schema); err != nil {
+		return "", err
+	}
+	return schema, nil
 }
 
 // execute executes a SQL statement within a transaction context.
@@ -246,101 +438,63 @@ func (*Store) execute(ctx context.Context, tx *sql.Tx, stmt string) error {
 	return nil
 }
 
-// updateCurrentSchemaVersion updates the current schema version in the workspace basic setting.
-// It retrieves the workspace basic setting, updates the schema version, and upserts the setting back to the database.
-func (s *Store) updateCurrentSchemaVersion(ctx context.Context, schemaVersion string) error {
-	workspaceBasicSetting, err := s.GetWorkspaceBasicSetting(ctx)
+// writeSchemaVersionTx sets basicSetting's schema version and writes it
+// within tx. The caller commits tx and then caches basicSetting.
+func (s *Store) writeSchemaVersionTx(ctx context.Context, tx *sql.Tx, basicSetting *storepb.InstanceBasicSetting, schemaVersion string) error {
+	basicSetting.SchemaVersion = schemaVersion
+	value, err := protojson.Marshal(basicSetting)
 	if err != nil {
-		return errors.Wrap(err, "failed to get workspace basic setting")
+		return errors.Wrap(err, "failed to marshal instance basic setting")
 	}
-	workspaceBasicSetting.SchemaVersion = schemaVersion
-	if _, err := s.UpsertWorkspaceSetting(ctx, &storepb.WorkspaceSetting{
-		Key:   storepb.WorkspaceSettingKey_BASIC,
-		Value: &storepb.WorkspaceSetting_BasicSetting{BasicSetting: workspaceBasicSetting},
+	if err := s.driver.UpsertInstanceSettingTx(ctx, tx, &InstanceSetting{
+		Name:  storepb.InstanceSettingKey_BASIC.String(),
+		Value: string(value),
 	}); err != nil {
-		return errors.Wrap(err, "failed to upsert workspace setting")
+		return errors.Wrap(err, "failed to update current schema version")
 	}
 	return nil
 }
 
-// normalizeMigrationHistoryList normalizes the migration history list.
-// It checks the existing migration history and updates it to the latest schema version if necessary.
-func (s *Store) normalizeMigrationHistoryList(ctx context.Context) error {
-	migrationHistoryList, err := s.driver.FindMigrationHistoryList(ctx, &FindMigrationHistory{})
-	if err != nil {
-		return errors.Wrap(err, "failed to find migration history")
-	}
-	versions := []string{}
-	for _, migrationHistory := range migrationHistoryList {
-		versions = append(versions, migrationHistory.Version)
-	}
-	if len(versions) == 0 {
-		return nil
-	}
-	sort.Sort(version.SortVersion(versions))
-	latestVersion := versions[len(versions)-1]
-	latestMinorVersion := version.GetMinorVersion(latestVersion)
+func (s *Store) cacheInstanceBasicSetting(ctx context.Context, basicSetting *storepb.InstanceBasicSetting) {
+	s.cacheInstanceSetting(ctx, &storepb.InstanceSetting{
+		Key:   storepb.InstanceSettingKey_BASIC,
+		Value: &storepb.InstanceSetting_BasicSetting{BasicSetting: basicSetting},
+	})
+}
 
-	// If the latest version is greater than 0.22, return.
-	// As of 0.22, the migration history is already normalized.
-	if version.IsVersionGreaterThan(latestMinorVersion, "0.22") {
-		return nil
-	}
-
-	schemaVersionMap := map[string]string{}
-	filePaths, err := fs.Glob(migrationFS, fmt.Sprintf("%s*/*.sql", s.getMigrationBasePath()))
+// checkMinimumUpgradeVersion rejects databases whose migration history is no longer shipped.
+// Fresh installations already have their schema version set by preMigrate.
+func (s *Store) checkMinimumUpgradeVersion(ctx context.Context) error {
+	instanceBasicSetting, err := s.GetInstanceBasicSetting(ctx)
 	if err != nil {
-		return errors.Wrap(err, "failed to read migration files")
+		return errors.Wrap(err, "failed to read database schema version")
 	}
-	sort.Strings(filePaths)
-	for _, filePath := range filePaths {
-		fileSchemaVersion, err := s.getSchemaVersionOfMigrateScript(filePath)
+	schemaVersion := instanceBasicSetting.SchemaVersion
+	if !isVersionEmpty(schemaVersion) {
+		order, err := compareSchemaVersions(schemaVersion, baselineSchemaVersion)
 		if err != nil {
-			return errors.Wrap(err, "failed to get schema version of migrate script")
+			return err
 		}
-		schemaVersionMap[version.GetMinorVersion(fileSchemaVersion)] = fileSchemaVersion
-	}
-
-	latestSchemaVersion := schemaVersionMap[latestMinorVersion]
-	if latestSchemaVersion == "" {
-		return errors.Errorf("latest schema version not found")
-	}
-	if version.IsVersionGreaterOrEqualThan(latestVersion, latestSchemaVersion) {
-		return nil
-	}
-	if _, err := s.driver.UpsertMigrationHistory(ctx, &UpsertMigrationHistory{
-		Version: latestSchemaVersion,
-	}); err != nil {
-		return errors.Wrap(err, "failed to upsert latest migration history")
-	}
-	return nil
-}
-
-// migrateSchemaVersionToSetting migrates the schema version from the migration history to the workspace basic setting.
-// It retrieves the migration history, sorts the versions, and updates the workspace basic setting if necessary.
-func (s *Store) migrateSchemaVersionToSetting(ctx context.Context) error {
-	migrationHistoryList, err := s.driver.FindMigrationHistoryList(ctx, &FindMigrationHistory{})
-	if err != nil {
-		return errors.Wrap(err, "failed to find migration history")
-	}
-	versions := []string{}
-	for _, migrationHistory := range migrationHistoryList {
-		versions = append(versions, migrationHistory.Version)
-	}
-	if len(versions) == 0 {
-		return nil
-	}
-	sort.Sort(version.SortVersion(versions))
-	latestVersion := versions[len(versions)-1]
-
-	workspaceBasicSetting, err := s.GetWorkspaceBasicSetting(ctx)
-	if err != nil {
-		return errors.Wrap(err, "failed to get workspace basic setting")
-	}
-	if version.IsVersionGreaterOrEqualThan(workspaceBasicSetting.SchemaVersion, latestVersion) {
-		if err := s.updateCurrentSchemaVersion(ctx, latestVersion); err != nil {
-			return errors.Wrap(err, "failed to update current schema version")
+		if order >= 0 {
+			return nil
 		}
 	}
-	return nil
+
+	upgradePath := "First upgrade to v0.31.0: https://github.com/usememos/memos/releases/tag/v0.31.0"
+	legacyOrder := -1
+	if !isVersionEmpty(schemaVersion) {
+		legacyOrder, err = compareSchemaVersions(schemaVersion, "0.22.0")
+		if err != nil {
+			return err
+		}
+	}
+	if legacyOrder < 0 {
+		upgradePath = "First upgrade to v0.25.3: https://github.com/usememos/memos/releases/tag/v0.25.3\n" +
+			"Start the server and verify it works, then upgrade to v0.31.0: https://github.com/usememos/memos/releases/tag/v0.31.0"
+	}
+	return errors.Errorf(
+		"database schema %q is too old to upgrade directly; minimum supported schema is %s.\n"+
+			"%s\nStart v0.31.0 and verify it works before upgrading to this version.",
+		schemaVersion, baselineSchemaVersion, upgradePath,
+	)
 }

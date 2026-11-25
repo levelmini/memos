@@ -1,11 +1,52 @@
-import { Attachment } from "@/types/proto/api/v1/attachment_service";
+import { Attachment, MotionMediaFamily, MotionMediaRole } from "@/types/proto/api/attachment_service_pb";
 
 export const getAttachmentUrl = (attachment: Attachment) => {
   if (attachment.externalLink) {
     return attachment.externalLink;
   }
 
-  return `${window.location.origin}/file/${attachment.name}/${attachment.filename}`;
+  return `${window.location.origin}/file/${attachment.name}/${encodeURIComponent(attachment.filename)}`;
+};
+
+/**
+ * Downloads an attachment's original file (never the thumbnail) with the session's
+ * credentials. Rejects when the server refuses it.
+ */
+export const fetchAttachmentFile = async (attachment: Attachment, signal?: AbortSignal): Promise<Response> => {
+  const response = await fetch(getAttachmentUrl(attachment), { signal, credentials: "same-origin" });
+  if (!response.ok) throw new Error(`Failed to download ${attachment.filename} (${response.status})`);
+  return response;
+};
+
+// Appends a thumbnail or motion selector only to share-mode links; other external links fall back to the server-managed attachment URL.
+const withShareTokenParam = (externalLink: string | undefined, key: string): string | undefined => {
+  if (!externalLink) {
+    return undefined;
+  }
+  const url = new URL(externalLink, window.location.origin);
+  if (!url.searchParams.has("share_token")) {
+    return undefined;
+  }
+  url.searchParams.set(key, "true");
+  return url.toString();
+};
+
+export const getAttachmentThumbnailUrl = (attachment: Attachment) => {
+  const shareUrl = withShareTokenParam(attachment.externalLink, "thumbnail");
+  if (shareUrl) {
+    return shareUrl;
+  }
+
+  return `${window.location.origin}/file/${attachment.name}/${encodeURIComponent(attachment.filename)}?thumbnail=true`;
+};
+
+export const getAttachmentMotionClipUrl = (attachment: Attachment) => {
+  const shareUrl = withShareTokenParam(attachment.externalLink, "motion");
+  if (shareUrl) {
+    return shareUrl;
+  }
+
+  return `${window.location.origin}/file/${attachment.name}/${encodeURIComponent(attachment.filename)}?motion=true`;
 };
 
 export const getAttachmentType = (attachment: Attachment) => {
@@ -48,3 +89,21 @@ export const isMidiFile = (mimeType: string): boolean => {
 const isPSD = (t: string) => {
   return t === "image/vnd.adobe.photoshop" || t === "image/x-photoshop" || t === "image/photoshop";
 };
+
+export const getAttachmentMotionGroupId = (attachment: Attachment): string | undefined => {
+  return attachment.motionMedia?.groupId || undefined;
+};
+
+export const isAppleLivePhotoStill = (attachment: Attachment): boolean =>
+  attachment.motionMedia?.family === MotionMediaFamily.APPLE_LIVE_PHOTO && attachment.motionMedia.role === MotionMediaRole.STILL;
+
+export const isAppleLivePhotoVideo = (attachment: Attachment): boolean =>
+  attachment.motionMedia?.family === MotionMediaFamily.APPLE_LIVE_PHOTO && attachment.motionMedia.role === MotionMediaRole.VIDEO;
+
+export const isAndroidMotionContainer = (attachment: Attachment): boolean =>
+  attachment.motionMedia?.family === MotionMediaFamily.ANDROID_MOTION_PHOTO &&
+  attachment.motionMedia.role === MotionMediaRole.CONTAINER &&
+  attachment.motionMedia.hasEmbeddedVideo;
+
+export const isMotionAttachment = (attachment: Attachment): boolean =>
+  isAppleLivePhotoStill(attachment) || isAppleLivePhotoVideo(attachment) || isAndroidMotionContainer(attachment);

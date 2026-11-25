@@ -1,184 +1,171 @@
-import { Suspense, lazy } from "react";
-import { createBrowserRouter } from "react-router-dom";
+import { createBrowserRouter, Navigate, type RouteObject, useLocation } from "react-router-dom";
 import App from "@/App";
-import HomeLayout from "@/layouts/HomeLayout";
+import { ChunkLoadErrorFallback } from "@/components/ErrorBoundary";
+import { preloadMemoEditing } from "@/components/MemoEditor";
+import { useAuth } from "@/contexts/AuthContext";
+import useCurrentUser from "@/hooks/useCurrentUser";
+import MainLayout from "@/layouts/MainLayout";
 import RootLayout from "@/layouts/RootLayout";
-import Home from "@/pages/Home";
-import Loading from "@/pages/Loading";
+import { lazyWithReload } from "@/utils/lazy";
+import { RequireAuthRoute, RequireFullInitializationRoute, RequireGuestRoute, RequireInstanceInitializationRoute } from "./guards";
+import { LegacyProfileRedirect } from "./LegacyProfileRedirect";
+import { CALENDAR_ROUTE_PATTERN, getCollectionCreator, ROUTES, SPACE_ROUTE_PATTERN, withCollectionCreator } from "./routes";
+import { SpaceRoute } from "./SpaceRoute";
 
-const AdminSignIn = lazy(() => import("@/pages/AdminSignIn"));
-const Archived = lazy(() => import("@/pages/Archived"));
-const AuthCallback = lazy(() => import("@/pages/AuthCallback"));
-const Explore = lazy(() => import("@/pages/Explore"));
-const Inboxes = lazy(() => import("@/pages/Inboxes"));
-const MemoDetail = lazy(() => import("@/pages/MemoDetail"));
-const NotFound = lazy(() => import("@/pages/NotFound"));
-const PermissionDenied = lazy(() => import("@/pages/PermissionDenied"));
-const Attachments = lazy(() => import("@/pages/Attachments"));
-const Setting = lazy(() => import("@/pages/Setting"));
-const SignIn = lazy(() => import("@/pages/SignIn"));
-const SignUp = lazy(() => import("@/pages/SignUp"));
-const UserProfile = lazy(() => import("@/pages/UserProfile"));
-const MemoDetailRedirect = lazy(() => import("./MemoDetailRedirect"));
+const AdminSignIn = lazyWithReload(() => import("@/pages/AdminSignIn"));
+const About = lazyWithReload(() => import("@/pages/About"));
+const Archived = lazyWithReload(() => import("@/pages/Archived"));
+const AuthCallback = lazyWithReload(() => import("@/pages/AuthCallback"));
+const MemoMap = lazyWithReload(() => import("@/pages/Map"));
+const Calendar = lazyWithReload(() => import("@/pages/Calendar"));
+const Home = lazyWithReload(() => import("@/pages/Home"));
+// A signed-in user's Home composes at once, so the page's code arrives together with the
+// editing session's and the composer renders with the page, never after it.
+const ComposingHome = lazyWithReload(() => Promise.all([import("@/pages/Home"), preloadMemoEditing()]).then(([page]) => page));
+const Inboxes = lazyWithReload(() => import("@/pages/Inboxes"));
+const MemoDetail = lazyWithReload(() => import("@/pages/MemoDetail"));
+const NotFound = lazyWithReload(() => import("@/pages/NotFound"));
+const PermissionDenied = lazyWithReload(() => import("@/pages/PermissionDenied"));
+const Attachments = lazyWithReload(() => import("@/pages/Attachments"));
+const Setting = lazyWithReload(() => import("@/pages/Setting"));
+const MemoViews = lazyWithReload(() => import("@/pages/MemoViews"));
+const SignIn = lazyWithReload(() => import("@/pages/SignIn"));
+const SignUp = lazyWithReload(() => import("@/pages/SignUp"));
 
-export enum Routes {
-  ROOT = "/",
-  ATTACHMENTS = "/attachments",
-  INBOX = "/inbox",
-  ARCHIVED = "/archived",
-  SETTING = "/setting",
-  EXPLORE = "/explore",
-  AUTH = "/auth",
-}
+const HomeRoute = () => {
+  const { isIdentityInitialized } = useAuth();
+  const currentUser = useCurrentUser();
+  const location = useLocation();
+  if (!isIdentityInitialized) return null;
+  if (!currentUser && !getCollectionCreator(location.search)) {
+    return <Navigate to={{ pathname: ROUTES.EXPLORE, search: location.search, hash: location.hash }} replace />;
+  }
+  return currentUser ? <ComposingHome /> : <Home />;
+};
 
-const router = createBrowserRouter([
+const ExploreRoute = () => {
+  const currentUser = useCurrentUser();
+  const location = useLocation();
+  const search = withCollectionCreator(location.search);
+  if (search !== location.search) return <Navigate to={{ pathname: location.pathname, search, hash: location.hash }} replace />;
+  return currentUser ? <ComposingHome /> : <Home />;
+};
+
+// Backward compatibility alias.
+export const Routes = ROUTES;
+export { ROUTES };
+
+/**
+ * Static route configuration. Exported so tests can assert on the tree shape
+ * (e.g. that `/auth/callback` stays outside the guest-only guard subtree) and
+ * so integration tests can drive a `createMemoryRouter` over the same tree.
+ */
+export const routeConfig: RouteObject[] = [
   {
     path: "/",
     element: <App />,
+    errorElement: <ChunkLoadErrorFallback />,
     children: [
       {
         path: Routes.AUTH,
         children: [
+          // The OAuth callback must run regardless of the current session — an
+          // authenticated tab elsewhere must not block it from consuming its
+          // one-time OAuth state. Keep it outside the guest-only subtree.
+          { path: "callback", element: <AuthCallback /> },
           {
-            path: "",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <SignIn />
-              </Suspense>
-            ),
-          },
-          {
-            path: "admin",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <AdminSignIn />
-              </Suspense>
-            ),
-          },
-          {
-            path: "signup",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <SignUp />
-              </Suspense>
-            ),
-          },
-          {
-            path: "callback",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <AuthCallback />
-              </Suspense>
-            ),
+            element: <RequireInstanceInitializationRoute />,
+            children: [
+              {
+                element: <RequireGuestRoute />,
+                children: [
+                  { path: "", element: <SignIn /> },
+                  { path: "admin", element: <AdminSignIn /> },
+                  { path: "signup", element: <SignUp /> },
+                ],
+              },
+            ],
           },
         ],
       },
+      // Backward compatibility: the old `/home` URL now lives at `/`.
+      { path: "home", element: <Navigate to={Routes.HOME} replace /> },
       {
-        path: Routes.ROOT,
         element: <RootLayout />,
         children: [
           {
-            element: <HomeLayout />,
+            element: <MainLayout />,
             children: [
+              { index: true, element: <HomeRoute /> },
               {
-                path: "",
-                element: <Home />,
+                element: <RequireInstanceInitializationRoute />,
+                children: [{ path: Routes.ABOUT, element: <About /> }],
               },
+              { path: Routes.EXPLORE, element: <ExploreRoute /> },
+              { path: "memos/:uid", element: <MemoDetail /> },
+              { path: "memos/shares/:token", element: <MemoDetail /> },
+              // Like Timeline, the calendar is public: guests see the memos readable to them.
+              { path: CALENDAR_ROUTE_PATTERN, element: <Calendar /> },
+              { path: Routes.USER_PROFILE, element: <LegacyProfileRedirect /> },
               {
-                path: Routes.ARCHIVED,
-                element: (
-                  <Suspense fallback={<Loading />}>
-                    <Archived />
-                  </Suspense>
-                ),
-              },
-              {
-                path: "u/:username",
-                element: (
-                  <Suspense fallback={<Loading />}>
-                    <UserProfile />
-                  </Suspense>
-                ),
+                element: <RequireAuthRoute />,
+                children: [
+                  { path: Routes.ARCHIVED, element: <Archived /> },
+                  {
+                    element: <RequireFullInitializationRoute />,
+                    children: [{ path: Routes.VIEWS, element: <MemoViews /> }],
+                  },
+                ],
               },
             ],
           },
           {
-            path: Routes.EXPLORE,
-            element: (
-              <Suspense fallback={<Loading />}>
-                <Explore />
-              </Suspense>
-            ),
+            element: <RequireFullInitializationRoute />,
+            children: [{ path: Routes.MAP, element: <MemoMap /> }],
           },
           {
-            path: Routes.ATTACHMENTS,
-            element: (
-              <Suspense fallback={<Loading />}>
-                <Attachments />
-              </Suspense>
-            ),
+            element: <RequireAuthRoute />,
+            children: [
+              {
+                element: <RequireFullInitializationRoute />,
+                children: [
+                  {
+                    path: SPACE_ROUTE_PATTERN,
+                    children: [
+                      {
+                        element: <SpaceRoute />,
+                        children: [
+                          {
+                            element: <MainLayout />,
+                            children: [
+                              // A Space has one timeline, every member's memos: no personal Home, no Explore page.
+                              { index: true, element: <ExploreRoute /> },
+                              { path: "calendar/:year?/:month?/:day?", element: <Calendar /> },
+                            ],
+                          },
+                          { path: "attachments", element: <Attachments /> },
+                          { path: "map", element: <MemoMap /> },
+                        ],
+                      },
+                      { path: "*", element: <NotFound /> },
+                    ],
+                  },
+                  { path: Routes.ATTACHMENTS, element: <Attachments /> },
+                  { path: Routes.INBOX, element: <Inboxes /> },
+                  { path: Routes.SETTING, element: <Setting /> },
+                ],
+              },
+            ],
           },
-          {
-            path: Routes.INBOX,
-            element: (
-              <Suspense fallback={<Loading />}>
-                <Inboxes />
-              </Suspense>
-            ),
-          },
-          {
-            path: Routes.SETTING,
-            element: (
-              <Suspense fallback={<Loading />}>
-                <Setting />
-              </Suspense>
-            ),
-          },
-          {
-            path: "memos/:uid",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <MemoDetail />
-              </Suspense>
-            ),
-          },
-          // Redirect old path to new path.
-          {
-            path: "m/:uid",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <MemoDetailRedirect />
-              </Suspense>
-            ),
-          },
-          {
-            path: "403",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <PermissionDenied />
-              </Suspense>
-            ),
-          },
-          {
-            path: "404",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <NotFound />
-              </Suspense>
-            ),
-          },
-          {
-            path: "*",
-            element: (
-              <Suspense fallback={<Loading />}>
-                <NotFound />
-              </Suspense>
-            ),
-          },
+          { path: "403", element: <PermissionDenied /> },
+          { path: "404", element: <NotFound /> },
+          { path: "*", element: <NotFound /> },
         ],
       },
     ],
   },
-]);
+];
+
+const router = createBrowserRouter(routeConfig);
 
 export default router;
